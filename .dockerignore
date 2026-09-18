@@ -1,0 +1,32 @@
+# Secrets never enter the image - OPENAI_API_KEY and AUTH_* are injected as
+# Container App secrets at runtime instead.
+.env
+.env.sodexo
+.env.example
+
+# Build/runtime cruft
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+node_modules/
+frontend_sodexo/node_modules/
+frontend_sodexo/dist/
+.run-logs/
+ml/mlruns/
+ml/mlflow.db
+data/*.db-journal
+
+# Local scratch files left by debugging sessions
+backend_sodexo/_*.log
+backend_sodexo/_*.txt
+backend_sodexo/_dump*.py
+mock_api_sodexo/_*.log
+scripts/inspect_output*.txt
+
+.git/
+.gitignore
+README.md
+docs/
