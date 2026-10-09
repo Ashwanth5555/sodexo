@@ -1,11 +1,18 @@
-"""Static per-series configuration - the equivalent of Meriton's Forecast
-Contract, but fixed at design time instead of profiled from an uploaded CSV,
-since our schema (2 locations x 2 departments, target=required_manpower) is
-already known.
+"""Forecasting constants shared by every series.
+
+This was the design-time contract for a fixed Sodexo schema - four series
+hardcoded here, with their own tables and target column. That schema is
+gone: every series now comes from a file the client uploaded, and its grain,
+seasonality and horizon are resolved per dataset in datasets/series.py.
+
+What remains is the portfolio definition (which models exist, which are slow,
+which are evaluated on a holdout) plus the half-day-grain constants the
+engine still reads. SERIES is empty and SeriesConfig unused by any live path;
+both are kept so the built-in training entry point stays a no-op rather than
+an import error.
 """
 from dataclasses import dataclass
 
-from app.models import FactCafeSales, FactCensus
 
 RANDOM_SEED = 42
 
@@ -45,6 +52,20 @@ SEASONAL_PERIOD_CANDIDATES = (SLOTS_PER_WEEK,)
 # pmdarima's seasonal search stays affordable at a weekly period.
 AUTO_ARIMA_MAX_SEASONAL_PERIOD = SLOTS_PER_WEEK
 
+# How much work SARIMAX and Exponential Smoothing may be asked to do for a
+# seasonal component. Both carry one state per seasonal slot and cost roughly
+# rows x period^2, so the limit has to account for both - a flat cap on the
+# period alone would either let hourly data through or rule out an annual cycle
+# on weekly data, which is cheap and perfectly reasonable.
+#
+#   hourly, 2 years, period 168 : 17,520 x 168^2 = 494M  - never finishes
+#   hourly, 2 years, period  24 : 17,520 x  24^2 =  10M  - fine
+#   weekly, 6 years, period  52 :    312 x  52^2 = 0.8M  - fine
+#
+# 50M sits well clear of both sides. Above it the model falls back to a shorter
+# seasonal candidate, and the long cycle is left to XGBoost's lag features.
+STATE_SPACE_SEASONAL_BUDGET = 50_000_000
+
 # Auto ARIMA (a stepwise order search) and LSTM (a neural-net training loop)
 # cost far more per fit than the rest of the portfolio, and running them
 # through 3 CV folds triples that. They use a single chronological holdout
@@ -53,7 +74,22 @@ AUTO_ARIMA_MAX_SEASONAL_PERIOD = SLOTS_PER_WEEK
 # CV-evaluated model, so the leaderboard stays apples-to-apples.
 FAST_HOLDOUT_MODEL_IDS = frozenset({"auto_arima", "auto_arima_exog", "lstm"})
 
-CALENDAR_EXOG_COLUMNS = ("is_holiday", "demand_multiplier", "season_Spring", "season_Summer", "season_Fall", "season_Winter")
+# The same three models, for a different reason: they dominate training cost.
+# Measured over one full 4-series run at half-day grain, the totals were
+# LSTM 1054s, Auto ARIMA 968s and Auto ARIMA+exog 882s - 88% of all model
+# time - while the champions were Exponential Smoothing (19s across all four
+# series) and VAR (under a second). Worth fitting when there is time to
+# spare; not worth making a client wait for on a 40-series upload. This is
+# what the "fast" training profile skips.
+SLOW_MODEL_IDS = frozenset({"auto_arima", "auto_arima_exog", "lstm"})
+
+SLOW_MODEL_SKIP_REASON = (
+    "Skipped in fast training mode - one of the three slowest models in the portfolio "
+    "(together 88% of training time), and it won on no series in benchmarking. "
+    "Set TRAINING_PROFILE=full to include it."
+)
+
+CALENDAR_EXOG_COLUMNS =("is_holiday", "demand_multiplier", "season_Spring", "season_Summer", "season_Fall", "season_Winter")
 
 # Real census/sales columns, used as inputs only in their one-week-lagged form
 # ("same half-day block, one week ago"). Because FORECAST_HORIZON_SLOTS is also
@@ -74,7 +110,7 @@ class SeriesConfig:
     key: str
     label: str
     location_id: str
-    fact_model: type
+    fact_model: type | None
     date_column: str
     hour_column: str
     target_column: str
@@ -83,14 +119,13 @@ class SeriesConfig:
     lagged_raw_columns: tuple[str, ...] = ()
 
 
-SERIES: list[SeriesConfig] = [
-    SeriesConfig("LOC01_FOOD_NUTRITION", "Community Hospital / Food & Nutrition Services", "LOC01", FactCensus, "business_date", "hour_of_day", "required_manpower", "occupied_beds", (), ("occupied_beds", "admissions_count", "discharges_count", "transfers_count", "meals_served")),
-    SeriesConfig("LOC02_FOOD_NUTRITION", "Regional Medical Center / Food & Nutrition Services", "LOC02", FactCensus, "business_date", "hour_of_day", "required_manpower", "occupied_beds", (), ("occupied_beds", "admissions_count", "discharges_count", "transfers_count", "meals_served")),
-    SeriesConfig("LOC01_CAFE", "Community Hospital / Retail & Cafe Services", "LOC01", FactCafeSales, "business_date", "hour_of_day", "required_manpower", "transaction_count", ("promotion_flag", "event_flag"), ("sales_amount", "transaction_count")),
-    SeriesConfig("LOC02_CAFE", "Regional Medical Center / Retail & Cafe Services", "LOC02", FactCafeSales, "business_date", "hour_of_day", "required_manpower", "transaction_count", ("promotion_flag", "event_flag"), ("sales_amount", "transaction_count")),
-]
+# No built-in series. This deployment forecasts whatever the client uploads
+# and nothing else - there is no Sodexo canonical dataset, so there are no
+# design-time series to fit. Every loop over SERIES is therefore a no-op,
+# which is what makes the built-in training path inert rather than removed.
+SERIES: list[SeriesConfig] = []
 
-SERIES_BY_KEY = {series.key: series for series in SERIES}
+SERIES_BY_KEY: dict[str, SeriesConfig] = {}
 
 # (model_id, label, dependency_module or None)
 MODEL_SPECS: list[tuple[str, str, str | None]] = [

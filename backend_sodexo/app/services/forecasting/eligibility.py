@@ -46,6 +46,22 @@ def check_eligibility(
         if not any(train_df[column].nunique(dropna=False) > 1 for column in exog_columns):
             return False, "VAR with exogenous variables requires at least one exogenous driver that actually varies in this training window (e.g. no holiday fell within it)."
 
+    if model_id == "auto_arima_exog" and exog_columns:
+        # Auto ARIMA does not fit one model, it searches - and every extra
+        # regressor multiplies the candidates that search must fit. Measured
+        # on four daily series: 99.6s per fit without drivers, 201.5s with
+        # eight, which was 44% of the whole run's work and doubled it end to
+        # end. The plain Auto ARIMA still runs, so the method is represented;
+        # the drivers reach the other eleven models, including XGBoost with
+        # exogenous variables, which reads the same eight columns in under
+        # three seconds.
+        return False, (
+            f"Excluded on cost: Auto ARIMA searches over model orders, so each of the "
+            f"{len(exog_columns)} driver columns multiplies the number of candidate fits. "
+            f"It doubled total training time for no accuracy the other exogenous models "
+            f"did not already provide. Plain Auto ARIMA still runs on the target."
+        )
+
     if model_id.startswith("exp_"):
         # Checked against the smallest CV fold's size, not the full window -
         # a period that only fits the full series but not an individual

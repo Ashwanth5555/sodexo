@@ -16,6 +16,7 @@ from pathlib import Path
 import pandas as pd
 
 from app.core.config import PROJECT_ROOT
+from app.services.datasets import cleaning
 
 UPLOAD_DIR = PROJECT_ROOT / "data" / "uploads"
 
@@ -48,15 +49,138 @@ class DatasetError(Exception):
     """A problem with the file or the mapping the user chose."""
 
 
+# The column a multi-sheet workbook's sheet names land in. Named with a
+# leading marker so it cannot silently collide with a column the client
+# already has - a file with its own "sheet" column would otherwise have it
+# overwritten.
+SHEET_COLUMN = "source_sheet"
+
+
+def _read_sheet(book: pd.ExcelFile, name: str, report: cleaning.Report) -> pd.DataFrame | None:
+    """One sheet, with its real header found first.
+
+    Read twice on purpose: once with no header to locate the row holding
+    the column names, then again from that row. A report with a title and a
+    run date above the table otherwise makes the title the name of column
+    one and the header row becomes the first row of data.
+    """
+    probe = book.parse(name, header=None, nrows=cleaning.MAX_HEADER_SCAN + 4)
+    header_row = cleaning.find_header_row(probe)
+    sheet = book.parse(name, header=header_row)
+    if header_row:
+        report.add(f"Header taken from row {header_row + 1}; the rows above it were a title or preamble.")
+    if not cleaning.is_data_sheet(sheet):
+        return None
+    return sheet
+
+
+def _read_excel(raw: bytes) -> pd.DataFrame:
+    """Read a workbook, combining every sheet into one frame.
+
+    Operational exports very often put one series per sheet - one per site,
+    per department, per product line. Reading only the first sheet, which is
+    what pandas does by default, silently discards the rest: a four-sheet
+    workbook would come in as a quarter of the data with no warning at all.
+
+    So every sheet is read and concatenated, with the sheet name kept in
+    SHEET_COLUMN. That makes the sheet name available as a grouping column,
+    which is what it almost always means.
+
+    Sheets need not share a schema. A catering sheet carrying `meals_served`
+    and a retail sheet carrying `transaction_count` union into one frame with
+    blanks where each does not apply, and the per-series build drops the
+    columns that are empty for that series.
+    """
+    book = pd.ExcelFile(io.BytesIO(raw))
+    report = cleaning.Report()
+
+    kept: list[tuple[str, pd.DataFrame]] = []
+    skipped: list[str] = []
+    for name in book.sheet_names:
+        sheet = _read_sheet(book, name, report)
+        if sheet is None:
+            skipped.append(str(name))
+            continue
+        kept.append((str(name), sheet))
+
+    if not kept:
+        raise DatasetError(
+            "No sheet in this workbook holds a table. Each sheet needs a header row and "
+            "at least a few rows of data beneath it."
+        )
+    if skipped:
+        # Notes, cover pages and legends. Naming them matters because the
+        # sheet name becomes the grouping, so a silently-kept README would
+        # appear as a series the client never asked to forecast.
+        report.add(f"Ignored {len(skipped)} sheet(s) holding no table: {', '.join(skipped[:4])}.")
+
+    dimension_names: list[str] = []
+    if len(kept) == 1:
+        frame = cleaning.clean(kept[0][1], report)
+    else:
+        cleaned = {name: cleaning.clean(sheet, report) for name, sheet in kept}
+        sheet_names = list(cleaned)
+
+        # If the sheets already carry the columns that tell them apart, use
+        # those. Splitting the names as well would hand the client two columns
+        # for every real dimension.
+        dimension_names = cleaning.sheet_label_columns(cleaned)
+        if dimension_names:
+            report.add(
+                f"Each sheet is one {' + '.join(dimension_names)}, "
+                f"read from the columns already in the file."
+            )
+            frames = list(cleaned.values())
+        else:
+            # Sheet names usually encode the dimensions they cut across, and
+            # splitting them turns one opaque label into the real columns the
+            # client thinks in - two sites by two departments rather than four
+            # sheet names.
+            dimensions = cleaning.split_sheet_names(sheet_names)
+            dimension_names = cleaning.name_sheet_dimensions(dimensions, sheet_names) if dimensions else []
+            if dimensions:
+                report.add(
+                    f"Split the sheet names into {', '.join(dimension_names)} - "
+                    f"{' x '.join(str(len(set(d['values'].values()))) for d in dimensions)} combinations."
+                )
+
+            frames = []
+            for name, sheet in cleaned.items():
+                if dimensions:
+                    for column, dimension in zip(dimension_names, dimensions):
+                        sheet[column] = dimension["values"][name]
+                else:
+                    sheet[SHEET_COLUMN] = name
+                frames.append(sheet)
+        # sort=False keeps the first sheet's column order, so the mapping
+        # form lists columns in the order the client wrote them.
+        frame = pd.concat(frames, ignore_index=True, sort=False)
+
+    frame.attrs["cleaning_notes"] = report.notes
+    frame.attrs["sheet_dimension_columns"] = dimension_names
+    return frame
+
+
 def _read_frame(filename: str, raw: bytes) -> pd.DataFrame:
     suffix = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     if suffix not in ALLOWED_EXTENSIONS:
         raise DatasetError(f"Unsupported file type '{suffix or filename}'. Upload a .csv or .xlsx file.")
     try:
         if suffix in EXCEL_EXTENSIONS:
-            return pd.read_excel(io.BytesIO(raw))
+            return _read_excel(raw)
         # sep=None + the python engine sniffs comma/semicolon/tab automatically.
-        return pd.read_csv(io.BytesIO(raw), sep=None, engine="python")
+        report = cleaning.Report()
+        probe = pd.read_csv(io.BytesIO(raw), sep=None, engine="python", header=None,
+                            nrows=cleaning.MAX_HEADER_SCAN + 4)
+        header_row = cleaning.find_header_row(probe)
+        csv = pd.read_csv(io.BytesIO(raw), sep=None, engine="python", header=header_row)
+        if header_row:
+            report.add(f"Header taken from row {header_row + 1}; the rows above it were a title or preamble.")
+        csv = cleaning.clean(csv, report)
+        csv.attrs["cleaning_notes"] = report.notes
+        return csv
+    except DatasetError:
+        raise
     except Exception as exc:
         raise DatasetError(f"Could not read the file: {exc}") from exc
 
@@ -93,21 +217,60 @@ def _looks_like_dates(series: pd.Series) -> bool:
     return parsed.notna().mean() >= 0.8
 
 
+def _structural_keys(frame: pd.DataFrame) -> list[pd.Series]:
+    """Columns whose value decides which *other* columns a row even has.
+
+    A file covering two departments carries each department's own measures:
+    beds and meals for catering, sales and transactions for retail. Stacked
+    into one table - by us across sheets, or by the client in one sheet - every
+    row is blank in the other department's columns. Judged as missing data that
+    file reads a fifth empty and every upload looks broken, so a column's blank
+    rate is measured only where the column applies at all.
+
+    Only low-cardinality text columns qualify, because a key has to name a part
+    of the business ("Retail Cafe"), not a row.
+    """
+    keys = [c for c in frame.attrs.get("sheet_dimension_columns", []) if c in frame.columns]
+    if not keys and SHEET_COLUMN in frame.columns:
+        keys = [SHEET_COLUMN]
+    if not keys:
+        limit = max(2, min(50, len(frame) // 100))
+        keys = [
+            name
+            for name in frame.columns
+            if not pd.api.types.is_numeric_dtype(frame[name])
+            and not pd.api.types.is_datetime64_any_dtype(frame[name])
+            and 1 < frame[name].nunique(dropna=False) <= limit
+        ]
+    return [frame[name] for name in keys[:4]]
+
+
 def profile_columns(frame: pd.DataFrame) -> list[dict]:
     """Per-column facts the mapping UI needs to suggest sensible defaults."""
-    total = len(frame)
+    keys = _structural_keys(frame)
+    key_names = {key.name for key in keys}
     profile = []
     for name in frame.columns:
         column = frame[name]
-        non_null = int(column.notna().sum())
-        is_numeric = bool(pd.api.types.is_numeric_dtype(column))
+        blank = column.isna()
+        scope = column
+        if name not in key_names and blank.any() and not blank.all():
+            for key in keys:
+                # Structural only when the column is wholly absent for some
+                # values of the key and wholly present for the rest. A column
+                # with scattered gaps inside a group really is missing data.
+                per_group = blank.groupby(key, dropna=False).mean()
+                if set(per_group.unique()) <= {0.0, 1.0}:
+                    scope = column[key.isin(per_group[per_group == 0.0].index)]
+                    break
+        counted = len(scope)
         samples = [str(v) for v in column.dropna().head(3).tolist()]
         profile.append({
             "name": name,
             "dtype": str(column.dtype),
-            "is_numeric": is_numeric,
+            "is_numeric": bool(pd.api.types.is_numeric_dtype(column)),
             "is_date_like": bool(_looks_like_dates(column)),
-            "null_pct": round((1 - (non_null / total)) * 100, 1) if total else 0.0,
+            "null_pct": round((1 - (int(scope.notna().sum()) / counted)) * 100, 1) if counted else 0.0,
             "distinct": int(column.nunique(dropna=True)),
             "samples": samples,
         })
@@ -184,8 +347,24 @@ def save_upload(filename: str, raw: bytes) -> tuple[str, pd.DataFrame, list[dict
 
     dataset_id = f"DS-{uuid.uuid4().hex[:12]}"
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    # The cleaned frame is what gets stored, so every later read sees the
+    # same rows the mapping was proposed against.
     frame.to_csv(UPLOAD_DIR / f"{dataset_id}.csv", index=False)
     return dataset_id, frame, profile_columns(frame)
+
+
+def load_preview(stored_filename: str, rows: int = 8) -> list[dict]:
+    """The first rows of a stored file, for showing what it contains.
+
+    Reads only those rows rather than the whole file: this is on the path of
+    every page load that shows the spreadsheet preview, and the files run to
+    hundreds of thousands of rows.
+    """
+    path = UPLOAD_DIR / stored_filename
+    if not path.exists():
+        return []
+    head = pd.read_csv(path, nrows=rows)
+    return head.astype(object).where(head.notna(), None).to_dict("records")
 
 
 def load_frame(stored_filename: str) -> pd.DataFrame:

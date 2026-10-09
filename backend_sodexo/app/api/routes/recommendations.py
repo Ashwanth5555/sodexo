@@ -10,7 +10,12 @@ router = APIRouter(prefix="/api/recommendations", tags=["recommendations"])
 
 @router.get("")
 def list_recommendations(db: Session = Depends(get_db)):
-    return {"recommendations": engine.compute_recommendations(db)}
+    recommendations = engine.compute_recommendations(db)
+    # An empty list is not self-explanatory, so it carries its reason.
+    return {
+        "recommendations": recommendations,
+        "note": None if recommendations else engine.empty_reason(db),
+    }
 
 
 class QuestionRequest(BaseModel):

@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react'
 import { Check } from 'lucide-react'
-import { LoadingState, ErrorState } from '../layout/PageContainer'
+import { LoadingState, ErrorState, EmptyState } from '../layout/PageContainer'
 import { Card, Badge } from '../ui/Card'
 import { fetchDrivers, setInputColumnEnabled, type DriversResponse } from '../../services/api'
+import { DatasetMappingCard } from './DatasetMappingCard'
 
-export function DemandDriversTab({ seriesKey }: { seriesKey: string }) {
+export function DemandDriversTab({ seriesKey, seriesLoading }: { seriesKey: string; seriesLoading?: boolean }) {
   const [drivers, setDrivers] = useState<DriversResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [saving, setSaving] = useState<string | null>(null)
@@ -28,13 +29,54 @@ export function DemandDriversTab({ seriesKey }: { seriesKey: string }) {
     }
   }
 
-  if (error) return <ErrorState message={error} />
-  if (!drivers || !series) return <LoadingState />
+  // Three states, not two. `series` is empty until something has been
+  // trained, and folding that into the loading branch left this page saying
+  // "Loading data..." forever on a fresh install - with the mapping card that
+  // explains why hidden behind it.
+  if (seriesLoading) {
+    return (
+      <div className="flex flex-col gap-5">
+        <DatasetMappingCard />
+        <LoadingState />
+      </div>
+    )
+  }
+  if (error) {
+    return (
+      <div className="flex flex-col gap-5">
+        <DatasetMappingCard />
+        <ErrorState message={error} />
+      </div>
+    )
+  }
+  if (!drivers) {
+    return (
+      <div className="flex flex-col gap-5">
+        <DatasetMappingCard />
+        <LoadingState />
+      </div>
+    )
+  }
+  if (!series) {
+    return (
+      <div className="flex flex-col gap-5">
+        <DatasetMappingCard />
+        <EmptyState
+          message={
+            drivers.series.length === 0
+              ? 'Per-series drivers appear once a model has been trained. Check the mapping above, then run Model Training.'
+              : 'That series is no longer available - pick another from the selector.'
+          }
+        />
+      </div>
+    )
+  }
 
   const enabledCount = series.available_input_columns.filter((c) => c.enabled).length
 
   return (
     <div className="flex flex-col gap-5">
+      <DatasetMappingCard />
       <Card>
         <div className="mb-4 flex items-center justify-between">
           <h2 className="text-sm font-semibold text-[var(--color-text)]">{series.series_label}</h2>

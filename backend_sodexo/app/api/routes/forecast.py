@@ -9,23 +9,33 @@ from app.services.datasets import series as dataset_series
 from app.services.datasets import training as dataset_training
 from app.services.datasets import workspace as dataset_workspace
 from app.services.forecasting import results
-from app.services.forecasting.contract import SERIES
 
 router = APIRouter(prefix="/api/forecast", tags=["forecast"])
 
 
 @router.get("/series")
-def list_series(db: Session = Depends(get_db)):
-    """Both kinds of series the app can forecast: the built-in canonical ones
-    and every configured uploaded dataset, so one picker drives every tab."""
-    built_in = [{"series_key": s.key, "series_label": s.label, "source": "built_in"} for s in SERIES]
-    # trained_only: an uploaded dataset appears here once it has been trained,
-    # never as a dead option that errors the moment it is selected.
+def list_series(
+    scope: str = Query("trained", pattern="^(trained|mapped)$"),
+    db: Session = Depends(get_db),
+):
+    """Every series the app can offer - all of them uploaded.
+
+    Two scopes, because the pages need different things:
+
+    - "trained" (default) lists only series with a completed model run. Anything
+      reading a forecast needs that, or selecting a series errors with "no
+      completed model found".
+    - "mapped" lists every series the column mapping produces, trained or not.
+      The exploratory pages - data analysis, pre-processing, drivers - read the
+      history rather than a forecast, so they work the moment a file is mapped,
+      and making them wait for a training run left them showing an empty picker
+      and a spinner that never resolved.
+    """
     uploaded = [
         {"series_key": s.key, "series_label": s.label, "source": "uploaded", "dataset_id": s.dataset_id}
-        for s in dataset_training.all_uploaded_series(db, trained_only=True)
+        for s in dataset_training.all_uploaded_series(db, trained_only=scope == "trained")
     ]
-    return {"series": built_in + uploaded}
+    return {"series": uploaded}
 
 
 @router.get("")
@@ -46,7 +56,10 @@ def get_forecast(
 
     # What this series actually forecasts, so the UI never has to assume the
     # canonical target/grain - an uploaded series has its own.
-    target_label, frequency_label = "required_manpower", "Half-day"
+    # No canonical default to fall back on - every series is an upload, and a
+    # label borrowed from data that no longer exists would name the wrong
+    # column at the wrong grain.
+    target_label, frequency_label = None, None
     if dataset_workspace.is_uploaded_series(series_key):
         dataset = db.get(UploadedDataset, series_key.split("__", 1)[0])
         if dataset is not None:

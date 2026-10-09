@@ -3,32 +3,63 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.models import ModelRun, TrainingJob
+from app.models import ModelRun, TrainingJob, UploadedDataset
 from app.services.datasets import training as dataset_training
-from app.services.forecasting import jobs, results
-from app.services.forecasting.contract import MODEL_SPECS, SERIES, SERIES_BY_KEY
+from app.services.forecasting import results
+from app.services.forecasting.contract import MODEL_SPECS
 
 router = APIRouter(prefix="/api/models", tags=["models"])
 
 
 @router.post("/train")
-def train_all_models(window_days: int | None = Query(None, ge=60, le=730, description="Override the training history window (days). Each day is one training row at this grain, so a short window leaves too few rows for 3 CV folds. Defaults to the server's configured window."), db: Session = Depends(get_db)):
-    """Trains every model against every series (2 locations x 2
-    departments) in a background thread and returns immediately with a job
-    id to poll. window_days lets the caller trade history for speed - a
-    smaller window means less data per model, so faster fits."""
+def train_all_models(window_days: int | None = Query(None, ge=60, le=730, description="Train on only the most recent N days. Fewer rows means faster fits; ignored if it would leave too little history to validate against."), db: Session = Depends(get_db)):
+    """Train the whole model portfolio on the uploaded data.
+
+    Every series in this app comes from a file the client uploaded, so this
+    trains the most recently configured one. It used to call the built-in
+    runner, which has had nothing to train since the sample data was removed -
+    the only working path was a button on the Data Quality page, and that page
+    is now upload and inspection only.
+    """
+    dataset = db.execute(
+        select(UploadedDataset)
+        .where(UploadedDataset.status == "configured")
+        .order_by(UploadedDataset.configured_at.desc())
+    ).scalars().first()
+    if dataset is None:
+        raise HTTPException(
+            status_code=409,
+            detail="No data to train. Upload a CSV or Excel file on the Data Quality page first.",
+        )
     try:
-        job_id = jobs.start_training_job(window_days=window_days)
-    except RuntimeError as exc:
+        job_id = dataset_training.start_dataset_training(dataset.dataset_id, window_days=window_days)
+    except (RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
     return {"job_id": job_id, "status": "RUNNING", "window_days": window_days}
 
 
 @router.get("/training-status")
 def training_status(db: Session = Depends(get_db)):
+    """The run the training page reports on.
+
+    A finished job is only reported while the runs it produced still exist.
+    Deleting a dataset now takes its jobs with it, but a job can also outlive
+    its data another way - an older database, a run whose series were remapped -
+    and the page reads "Last run completed, 26/26" over a leaderboard that says
+    no training has happened. A running job is always reported, because it has
+    not written its runs yet.
+    """
     job = db.execute(select(TrainingJob).order_by(TrainingJob.started_at.desc())).scalars().first()
     if not job:
         return {"job": None}
+    if job.status != "RUNNING":
+        produced = db.execute(
+            select(ModelRun.id).where(ModelRun.job_id == job.job_id).limit(1)
+        ).scalars().first()
+        if produced is None:
+            return {"job": None}
     return {
         "job": {
             "job_id": job.job_id, "status": job.status, "started_at": job.started_at, "completed_at": job.completed_at,
@@ -71,13 +102,13 @@ def leaderboard(db: Session = Depends(get_db)):
 
     # Built-in series first, then every configured uploaded one, each showing
     # its own most recent training run.
-    known = [(s.key, s.label) for s in SERIES]
+    known: list[tuple[str, str]] = []
     known += [(s.key, s.label) for s in dataset_training.all_uploaded_series(db)]
 
     series_payload = []
     for key, label in known:
         series_runs = by_series.get(key, {})
-        if not series_runs and key not in {s.key for s in SERIES}:
+        if not series_runs:
             continue  # an uploaded series that has never been trained
         models = [_run_payload(model_id, model_label, series_runs.get(model_id)) for model_id, model_label, _dep in MODEL_SPECS]
         models.sort(key=lambda m: (m["status"] == "pending", m["rank"] is None, m["rank"] if m["rank"] is not None else 0, m["model_label"]))
@@ -93,7 +124,7 @@ def leaderboard(db: Session = Depends(get_db)):
 def champions(db: Session = Depends(get_db)):
     job = _latest_job(db)
     runs = results.champions(db)
-    labels = {s.key: s.label for s in SERIES}
+    labels: dict[str, str] = {}
     labels.update({s.key: s.label for s in dataset_training.all_uploaded_series(db)})
     return {
         "job_id": job.job_id if job else None,

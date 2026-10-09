@@ -35,11 +35,6 @@ export interface IngestionBatch {
   error_message: string | null
 }
 
-export async function runIngestion() {
-  const { data } = await api.post<{ started_at: string; finished_at: string; batches: IngestionBatch[] }>('/ingestion/run')
-  return data
-}
-
 export interface UploadDataset {
   key: string
   label: string
@@ -58,23 +53,7 @@ export interface UploadResult {
   records_rejected: number
 }
 
-export async function fetchUploadDatasets() {
-  const { data } = await api.get<{ datasets: UploadDataset[]; accepted_extensions: string[]; max_bytes: number }>('/ingestion/upload/datasets')
-  return data
-}
-
-export async function uploadDataset(dataset: string, file: File) {
-  const form = new FormData()
-  form.append('dataset', dataset)
-  form.append('file', file)
-  const { data } = await api.post<UploadResult>('/ingestion/upload', form)
-  return data
-}
-
 /** Header-only CSV for a dataset - the exact columns the loader expects. */
-export function uploadTemplateUrl(dataset: string) {
-  return `/api/ingestion/upload/template/${dataset}`
-}
 
 // --- Uploaded datasets: forecast any CSV -----------------------------------
 
@@ -101,7 +80,7 @@ export interface Dataset {
   row_count: number
   date_column: string | null
   target_column: string | null
-  group_column: string | null
+  group_columns: string[]
   frequency: string | null
   aggregation: string
   horizon_periods: number
@@ -109,23 +88,43 @@ export interface Dataset {
   created_at: string | null
   series: DatasetSeriesRef[]
   column_profile?: DatasetColumn[]
+  capacity_column: string | null
+  /** "llm" when a model read the columns, "heuristic" when rules did. */
+  mapping_source: string | null
+  mapping_reasoning: string | null
 }
 
 export interface Option { value: string; label: string }
 
 export interface DatasetUploadResponse extends Dataset {
   column_profile: DatasetColumn[]
-  suggestion: { date_column: string | null; target_column: string | null; group_column: string | null; group_candidates: string[] }
+  suggestion: {
+    date_column: string | null
+    target_column: string | null
+    group_columns: string[]
+    capacity_column: string | null
+    driver_columns: string[]
+    group_candidates: string[]
+    source: string
+    reasoning: string
+  }
   frequencies: Option[]
   aggregations: Option[]
   preview: Record<string, unknown>[]
+  /** Raised at upload, because the mapping is applied there now. */
+  warnings: string[]
+  /** What we had to do to read the file - dropped total rows, unpivoted a
+   *  cross-tab, split the sheet names. Shown so the reader can tell whether
+   *  the numbers came out of the file the way they expected. */
+  cleaning_notes: string[]
 }
 
 export interface DatasetMapping {
+  capacity_column?: string | null
+  group_columns?: string[]
   name?: string
   date_column: string
   target_column: string
-  group_column?: string | null
   frequency: string
   aggregation: string
   horizon_periods: number
@@ -137,11 +136,41 @@ export interface ConfigureResponse extends Dataset {
   history_periods: number
   history_start: string
   history_end: string
+  /** Valid mapping, but something about it will disappoint - usually a
+   *  grouping that leaves each series too short for the seasonal models. */
+  warnings: string[]
 }
 
 export async function fetchDatasets() {
   const { data } = await api.get<{ datasets: Dataset[]; frequencies: Option[]; aggregations: Option[] }>('/datasets')
   return data
+}
+
+/** What the server accepts. Fetched so the UI can never state a stale limit. */
+export interface UploadRequirements {
+  accepted_extensions: string[]
+  max_file_mb: number
+  max_rows: number
+  max_series: number
+  min_rows_per_series: number
+  frequencies: { value: string; label: string; default_horizon: number }[]
+  aggregations: Option[]
+  columns: { name: string; role: string; role_label: string; purpose: string; required: boolean }[]
+  roles: { role: string; label: string; explanation: string }[]
+  example_series_count: number
+  example_combination: string
+  notes: string[]
+}
+
+export async function fetchUploadRequirements() {
+  const { data } = await api.get<UploadRequirements>('/datasets/requirements')
+  return data
+}
+
+/** Plain href rather than an axios call: the browser should handle this as a
+ *  download, and axios would buffer the whole file into memory first. */
+export function templateDownloadUrl() {
+  return '/api/datasets/template'
 }
 
 export async function uploadDatasetFile(file: File) {
@@ -156,6 +185,19 @@ export async function configureDataset(datasetId: string, mapping: DatasetMappin
   return data
 }
 
+/** One dataset, with its column profile.
+ *
+ *  The list endpoint leaves the profile out to keep the payload small, so
+ *  anything that needs the actual column names - the mapping form's dropdowns -
+ *  has to ask for the dataset on its own. */
+export async function fetchDataset(datasetId: string, includePreview = false) {
+  const { data } = await api.get<Dataset & { preview?: Record<string, unknown>[] }>(
+    `/datasets/${datasetId}`,
+    { params: includePreview ? { include_preview: true } : {} },
+  )
+  return data
+}
+
 export async function trainDataset(datasetId: string) {
   const { data } = await api.post<{ job_id: string; status: string }>(`/datasets/${datasetId}/train`)
   return data
@@ -164,11 +206,6 @@ export async function trainDataset(datasetId: string) {
 export async function deleteDataset(datasetId: string) {
   const { data } = await api.delete<{ deleted: string }>(`/datasets/${datasetId}`)
   return data
-}
-
-export async function fetchIngestionStatus() {
-  const { data } = await api.get<{ sources: (IngestionBatch & { started_at: string; completed_at: string | null })[] }>('/ingestion/status')
-  return data.sources
 }
 
 export interface TrainingJobStatus {
@@ -233,8 +270,13 @@ export interface SeriesOption {
   dataset_id?: string
 }
 
-export async function fetchSeriesOptions() {
-  const { data } = await api.get<{ series: SeriesOption[] }>('/forecast/series')
+/** The series a page can offer.
+ *
+ *  "trained" only lists series with a completed model run - anything showing a
+ *  forecast needs that. "mapped" lists everything the column mapping produces,
+ *  for the pages that read history instead of a forecast. */
+export async function fetchSeriesOptions(scope: 'trained' | 'mapped' = 'trained') {
+  const { data } = await api.get<{ series: SeriesOption[] }>('/forecast/series', { params: { scope } })
   return data.series
 }
 
@@ -310,6 +352,9 @@ export interface PreprocessingResponse {
   resolved_seasonal_period_slots: number | null
   training_window_rows: number
   block_hours: number
+  /** What one row's period is called - Hourly, Daily, Weekly, Monthly. Comes
+   *  from the uploaded file rather than being assumed. */
+  period_label: string
   seasonal_period_label: string
   validation_plan: { mode: string; fold_validation_size_days: number; fold_count: number; note: string }
   input_dataset: { rows: number; columns: number }
@@ -407,17 +452,62 @@ export async function fetchDrift(seriesKey: string, modelId?: string) {
 
 export interface StaffingImpactPoint {
   date: string
+  /** Actual for periods on record, the champion's forecast for periods ahead. */
   required_headcount: number
-  scheduled_headcount: number
-  gap: number
-  status: string
+  /** What this slot has actually been running lately - a recent norm, not a
+   *  forecast and not a plan. Null when the history is too thin to say. */
+  baseline: number | null
+  vs_baseline_pct: number | null
+  /** Requirement plus the champion's measured error, so a roster built to it
+   *  absorbs the forecast being low. Forecast periods only. */
+  recommended_headcount: number | null
+  /** Null where the file records no plan for this period - which is normal
+   *  for forecast periods, since a roster written ahead may not reach them. */
+  scheduled_headcount: number | null
+  gap: number | null
+  status: string | null
+  /** True for periods that have not happened yet: the requirement is the
+   *  trained champion's forecast rather than a recorded actual. */
+  is_forecast: boolean
+}
+
+export interface StaffingOutlook {
+  periods: number
+  start: string | null
+  end: string | null
+  total_required: number | null
+  total_baseline: number | null
+  change_pct: number | null
+  recommended_total: number | null
+  peak: { date: string; required: number } | null
+  quiet: { date: string; required: number } | null
+  planned_periods: number
+  total_planned: number | null
+  short_periods: number
+  surplus_periods: number
+  total_shortfall: number
+  largest_shortfall: { date: string; gap: number } | null
+  baseline_basis: string
+  baseline_rows: number
+  buffer: { value: number | null; model: string | null; accuracy: number | null; basis: string | null }
 }
 
 export interface StaffingImpactResponse {
   series_key: string
+  series_label?: string
   window_start?: string
   window_end?: string
+  required_label?: string
+  scheduled_label?: string | null
+  period_label?: string
+  period_unit?: string
+  /** plan - the file carries a roster for the periods ahead, so the gap is
+   *  real. forecast - requirement and recommendation only. history - nothing
+   *  trained yet. empty - the series cannot be read at all. */
+  mode?: 'plan' | 'forecast' | 'history' | 'empty'
   note: string
+  outlook?: StaffingOutlook
+  needs_capacity_column?: boolean
   points: StaffingImpactPoint[]
 }
 
@@ -572,8 +662,10 @@ export interface Recommendation {
 }
 
 export async function fetchRecommendations() {
-  const { data } = await api.get<{ recommendations: Recommendation[] }>('/recommendations')
-  return data.recommendations
+  // The note comes back only when the list is empty, and says which of the
+  // two empty cases it is: nothing to compare against, or nothing wrong.
+  const { data } = await api.get<{ recommendations: Recommendation[]; note: string | null }>('/recommendations')
+  return data
 }
 
 export async function askRecommendationQuestion(question: string) {
@@ -626,19 +718,30 @@ export async function askAssistant(question: string, history: AssistantTurn[] = 
   return data
 }
 
-export interface DataQualitySource extends IngestionBatch {
+/** Health of one uploaded file, not of a source-system sync. */
+export interface DataQualitySource {
   source_system: string
   source_endpoint: string
-  started_at: string
-  completed_at: string | null
   dataset_label: string
+  dataset_id: string
+  status: string
+  started_at: string | null
+  completed_at: string | null
+  records_received: number
+  records_loaded: number
+  records_rejected: number
   freshness_hours: number | null
   quality_status: string
+  /** Problems with this file's mapping, phrased for the person who uploaded it. */
+  issues: string[]
+  mapping_source: string | null
+  series_count: number
 }
 
 export interface DataQualitySummary {
   sources: DataQualitySource[]
   summary: { total_sources: number; total_records_received: number; total_records_rejected: number; overall_quality_status: string }
+  empty_message: string | null
 }
 
 export async function fetchDataQualitySummary() {

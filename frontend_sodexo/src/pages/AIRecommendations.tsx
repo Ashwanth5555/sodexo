@@ -65,13 +65,19 @@ function Block({ label, text }: { label: string; text: string }) {
 
 export default function AIRecommendations() {
   const [recs, setRecs] = useState<Recommendation[] | null>(null)
+  const [note, setNote] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [priorityFilter, setPriorityFilter] = useState('')
   const [categoryFilter, setCategoryFilter] = useState('')
   const [siteFilter, setSiteFilter] = useState('')
 
   useEffect(() => {
-    fetchRecommendations().then(setRecs).catch((err) => setError(err?.response?.data?.detail ?? String(err)))
+    fetchRecommendations()
+      .then((d) => {
+        setRecs(d.recommendations)
+        setNote(d.note)
+      })
+      .catch((err) => setError(err?.response?.data?.detail ?? String(err)))
   }, [])
 
   const all = recs ?? []
@@ -154,8 +160,9 @@ export default function AIRecommendations() {
           )}
         </div>
         <p className="mt-1.5 text-[10px] text-[var(--color-text-muted)]">
-          Click any column or slice to filter the page. Each action is derived from the current staffing gap,
-          employee risk scores, and labor cost against budget — with the supporting figures shown on the card.
+          Each action comes from one comparison: the requirement recorded in your file against the planned figure
+          recorded beside it, over the last 14 periods. Where a period falls short, the other series in the same file
+          are checked for spare capacity at that moment. Every figure behind an action is shown on its card.
         </p>
       </Card>
 
@@ -163,7 +170,7 @@ export default function AIRecommendations() {
       {!recs && !error && <LoadingState />}
 
       {recs && !error && (all.length === 0 ? (
-        <EmptyState message="No recommendations currently flagged — all monitored metrics are within tolerance." />
+        <EmptyState message={note ?? 'No recommendations currently flagged.'} />
       ) : (
         <>
           <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">

@@ -4,6 +4,7 @@ import AIRecommendations from './pages/AIRecommendations'
 import AIAssistant from './pages/AIAssistant'
 import DataQuality from './pages/DataQuality'
 import Login from './pages/Login'
+import { LABOR_FORECASTING_HOME } from './components/layout/Sidebar'
 import { AuthProvider } from './auth/AuthContext'
 import { RequireAuth } from './auth/RequireAuth'
 
@@ -20,7 +21,7 @@ export default function App() {
               <RequireAuth>
                 <Routes>
                   <Route path="/" element={<Navigate to="/data-quality" replace />} />
-                  <Route path="/labor-forecasting" element={<Navigate to="/labor-forecasting/model-training" replace />} />
+                  <Route path="/labor-forecasting" element={<Navigate to={`/labor-forecasting/${LABOR_FORECASTING_HOME}`} replace />} />
                   <Route path="/labor-forecasting/:section" element={<LaborForecasting />} />
                   <Route path="/ai-recommendations" element={<AIRecommendations />} />
                   <Route path="/ai-assistant" element={<AIAssistant />} />

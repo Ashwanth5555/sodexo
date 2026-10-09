@@ -8,34 +8,34 @@ logger = logging.getLogger(__name__)
 
 # Both replies use the same bullet structure the real answers do, so an
 # out-of-scope question or a plain "hi" still looks like part of the product.
-_SCOPE_MESSAGE = """That one is outside what I can see - I only read this application's own workforce data.
+_SCOPE_MESSAGE = """That one is outside what I can see - I only read the data in this application.
 
 **I can help with**
-- Labor demand forecasts and where demand is heading
-- Staffing gaps, where a shift is short of people or overstaffed
-- Labor cost against budget, and overtime
-- Punch and attendance issues
-- Employee risk scores, and what to act on first
-- Data quality, and whether the forecast models still fit the data
+- Demand forecasts, and where demand is heading
+- Capacity gaps - where a period is short of what was planned, or has too much
+- Model accuracy, and which model won for each series
+- Drift - whether a trained model can still be trusted
+- Data quality of the file you uploaded
+- The ranked list of recommended actions
 
 **Try**
-- "What is the demand trend for the cafe?"
-- "Which department is over budget?\""""
+- "What is the demand trend?"
+- "Where are the biggest capacity gaps?\""""
 
-_GREETING_MESSAGE = """Hello - good to have you here. I am the workforce assistant for this Sodexo Healthcare build, and every number I give you is read from this application's own data.
+_GREETING_MESSAGE = """Hello. I am the forecasting assistant for this application, and every number I give you is read from the data you uploaded - never invented.
 
 **What I can tell you about**
-- **Demand forecasts** - where labor demand is heading, and how reliable that forecast is
-- **Staffing gaps** - which shifts are short of people, and by how many
-- **Cost and overtime** - spend against budget, and where overtime is building
-- **Punch and attendance** - flagged issues and what is driving them
+- **Demand forecasts** - where demand is heading, and how reliable that forecast is
+- **Capacity gaps** - which periods fall short of what was planned, and by how much
+- **Model performance** - which of the models won for each series, and how accurate it is
+- **Drift** - whether the data has moved away from what the models were trained on
+- **Data quality** - how much of your file was usable, and what was not
 - **What to do next** - the current recommendations, ranked by priority
-- **Data quality and drift** - whether the data and the models can still be trusted
 
 **A good place to start**
-- "Which location needs immediate attention?"
-- "How can I reduce overtime this week?"
-- "Show me a chart of the demand trend for the cafe\""""
+- "What is the demand trend?"
+- "Which series needs attention first?"
+- "Show me a chart of the forecast\""""
 
 
 def ask(db: Session, question: str, history: list[dict] | None = None, current_scope: dict | None = None) -> dict:

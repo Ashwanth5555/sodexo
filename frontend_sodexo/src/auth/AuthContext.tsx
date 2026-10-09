@@ -5,6 +5,7 @@ export interface AuthUser {
   username: string
   full_name: string
   role: string
+  job_title: string
 }
 
 interface AuthState {
@@ -85,4 +86,5 @@ export const ROLE_LABELS: Record<string, string> = {
   ADMIN: 'Administrator',
   OPERATIONS_MANAGER: 'Operations Manager',
   DATA_ANALYST: 'Data Analyst',
+  EXECUTIVE: 'Executive',
 }

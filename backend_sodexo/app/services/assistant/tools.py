@@ -9,12 +9,15 @@ question like "who is most likely to leave?" or "which site is worst on
 cost?" can only be answered accurately if the named rows behind the KPI are
 in the facts, not just the count.
 """
+import logging
 import re
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import ModelPrediction, ModelRun, TrainingJob
+
+logger = logging.getLogger(__name__)
 
 
 def _latest_job(db: Session) -> TrainingJob | None:
@@ -34,10 +37,28 @@ def _daily_forecast_for_run(db: Session, run: ModelRun) -> list[dict]:
     return [{"date": d, "forecast": round(sum(v) / len(v), 2)} for d, v in sorted(by_date.items())]
 
 
+def _periods_per_day(db: Session, series_key: str) -> int:
+    """How many rows one day of this series occupies.
+
+    The canonical grain was two half-day blocks a day, and that constant was
+    being used to size history windows for uploaded data too - so "the last 30
+    days" asked for 60 rows, which is 60 days of a daily file and two and a
+    half hours of an hourly one. Read it from the dataset instead.
+    """
+    try:
+        from app.services.datasets.series import grain_for
+        from app.services.datasets.workspace import resolve
+
+        dataset, _spec = resolve(db, series_key)
+        return max(1, grain_for(dataset.frequency or "D")["per_day"])
+    except Exception:
+        return 1
+
+
 def _project_from_history(db: Session, run: ModelRun, slots: int, pct_change: float | None) -> float | None:
     """A historical-average projection for a horizon the model was never
     validated at (monthly/quarterly) - the average of the most recent
-    `slots` real ACTUAL half-day-block values, nudged by the model's own
+    `slots` real ACTUAL values at the series' own grain, nudged by the model's own
     validated 7-day trend direction.
 
     Deliberately sourced from ModelPrediction (the same table
@@ -96,17 +117,55 @@ def _trend_for_run(db: Session, run: ModelRun) -> dict | None:
     return {"avg_recent_actual": round(avg_recent, 2), "avg_forecast_next_7d": round(avg_future, 2), "pct_change": pct_change, "direction": direction}
 
 
-# Department and location are matched separately so "the cafe at Community
-# Hospital" narrows to exactly one series instead of matching all three
-# series that mention either word.
-_DEPARTMENT_ALIASES = {
-    "CAFE": ("cafe", "cafes", "café", "retail", "coffee", "kiosk"),
-    "FOOD_NUTRITION": ("food", "nutrition", "kitchen", "catering", "food & nutrition", "food and nutrition"),
-}
-_LOCATION_ALIASES = {
-    "LOC01": ("community hospital", "community", "loc01", "loc 01", "location 1", "site 1"),
-    "LOC02": ("regional medical", "regional", "loc02", "loc 02", "location 2", "site 2"),
-}
+# Scoping is derived from the data, not declared here.
+#
+# This used to be two hardcoded alias tables - LOC01 meaning "community
+# hospital", CAFE meaning "cafe"/"retail"/"kiosk" - which only worked for the
+# Sodexo dataset. With every series coming from a client upload, the words
+# that identify a series are the words the CLIENT put in their group column,
+# so the vocabulary has to be built from the dataset at question time.
+
+
+def _series_aliases(series_list) -> dict[str, tuple[str, ...]]:
+    """series_key -> the words that would make someone mean that series.
+
+    Built from each series' own label. A label like "Depot labour plan /
+    North Depot" yields "north", "depot", "labour", "plan" - so "how is
+    north depot doing" scopes to it. Short tokens are dropped: matching on
+    "of" or "and" would scope every question to whichever series happened to
+    contain them.
+    """
+    aliases: dict[str, tuple[str, ...]] = {}
+    for series in series_list:
+        label = (series.label or "").lower()
+        tokens = {t for t in _words(label) if len(t) > 3}
+        # The full label as one phrase, so "north depot" beats either word
+        # alone when both appear.
+        phrases = {p.strip() for p in label.split("/") if len(p.strip()) > 3}
+        aliases[series.key] = tuple(tokens | phrases)
+    return aliases
+
+
+def _discriminating_aliases(aliases: dict[str, tuple[str, ...]]) -> dict[str, tuple[str, ...]]:
+    """Drop words shared by every series.
+
+    Splitting one file by group gives labels with a common prefix - "Depot
+    labour plan / North Depot" and "Depot labour plan / South Depot" share
+    three words out of four. Matching on those would scope to everything,
+    which is the same as not scoping at all, so only the words that actually
+    tell two series apart are kept.
+    """
+    if len(aliases) < 2:
+        return aliases
+    counts: dict[str, int] = {}
+    for terms in aliases.values():
+        for term in set(terms):
+            counts[term] = counts.get(term, 0) + 1
+    total = len(aliases)
+    return {
+        key: tuple(t for t in terms if counts.get(t, 0) < total) or terms
+        for key, terms in aliases.items()
+    }
 
 
 def _alias_hits(question: str, aliases: dict[str, tuple[str, ...]]) -> set[str]:
@@ -121,61 +180,94 @@ def _alias_hits(question: str, aliases: dict[str, tuple[str, ...]]) -> set[str]:
     return hit
 
 
-# dim_department: DEP01 = Food & Nutrition Services, DEP02 = Retail & Cafe Services.
-_DEPARTMENT_IDS = {"FOOD_NUTRITION": "DEP01", "CAFE": "DEP02"}
+def _scope_label(question: str, series_list=None) -> str:
+    """What the question narrowed to, in words.
 
-
-def _scope_employees(question: str, rows: list[dict]) -> list[dict]:
-    """Narrow employee-level rows to the site/department the question names.
-
-    Without this, a "who is highest risk at the cafe?" question was answered
-    from the global top-N, so the right employee was only ever included by
-    luck. Falls back to the unfiltered rows when the filter empties the list,
-    so a scoped question still gets an answer rather than silence.
+    Names the matched series, because with uploaded data there is no fixed
+    vocabulary of sites and departments to name instead.
     """
-    locations = _alias_hits(question, _LOCATION_ALIASES)
-    departments = {_DEPARTMENT_IDS[d] for d in _alias_hits(question, _DEPARTMENT_ALIASES) if d in _DEPARTMENT_IDS}
-    if not locations and not departments:
-        return rows
-    scoped = [
-        r for r in rows
-        if (not locations or r.get("location_id") in locations)
-        and (not departments or r.get("department_id") in departments)
-    ]
-    return scoped or rows
+    if not series_list:
+        return "everything loaded"
+    matched = _mentioned_series(question, series_list)
+    if len(matched) >= len(series_list):
+        return "everything loaded"
+    return ", ".join(s.label for s in matched)
 
 
-_SCOPE_NAMES = {
-    "LOC01": "Community Hospital", "LOC02": "Regional Medical Center",
-    "CAFE": "Retail & Cafe Services", "FOOD_NUTRITION": "Food & Nutrition Services",
-}
+class _SeriesRef:
+    """A series the assistant can talk about.
+
+    location_id and `uploaded` are vestiges of the period when built-in and
+    uploaded series coexisted and tools had to branch on which was which.
+    They are kept because the scoping helpers still read them, and because a
+    second source would reintroduce the distinction.
+    """
+
+    __slots__ = ("key", "label", "location_id", "uploaded")
+
+    def __init__(self, key: str, label: str, location_id: str | None, uploaded: bool):
+        self.key = key
+        self.label = label
+        self.location_id = location_id
+        self.uploaded = uploaded
 
 
-def _scope_label(question: str) -> str:
-    """What the question narrowed to, in words. The site-level payloads carry
-    every department so a ranking question can be answered, which means the
-    answer needs telling which row the user actually asked about - otherwise a
-    scoped question gets answered with the company-wide total."""
-    codes = sorted(_alias_hits(question, _LOCATION_ALIASES)) + sorted(_alias_hits(question, _DEPARTMENT_ALIASES))
-    if not codes:
-        return "all sites and departments"
-    return ", ".join(_SCOPE_NAMES[c] for c in codes)
+def series_unit(db: Session, ref) -> str:
+    """What one unit of this series' target actually is, in words.
+
+    The built-in series forecast required_manpower per half-day block, which
+    the answers have always called "required staff/hour". An uploaded series
+    forecasts whatever column the client picked, at whatever frequency they
+    chose - calling that "staff/hour" states a unit the number does not have.
+    """
+    if not getattr(ref, "uploaded", False):
+        return "required staff/hour"
+    try:
+        from app.services.datasets.workspace import resolve
+
+        dataset, _spec = resolve(db, ref.key)
+        target = dataset.target_column or "units"
+        period = {"H": "hour", "D": "day", "W": "week", "MS": "month"}.get(dataset.frequency or "D", "period")
+        return f"{target} per {period}"
+    except Exception:
+        return "units"
+
+
+def all_series(db: Session) -> list[_SeriesRef]:
+    """Every trained uploaded series - there are no built-in ones.
+
+    Trained only: a dataset that has been mapped but never trained has no
+    results to answer from, and including it would put "no completed model"
+    noise into an answer instead of a fact.
+    """
+    from app.services.datasets.training import all_uploaded_series
+
+    try:
+        return [
+            _SeriesRef(s.key, s.label, None, uploaded=True)
+            for s in all_uploaded_series(db, trained_only=True)
+        ]
+    except Exception:
+        # A dataset whose file went missing must not stop the assistant
+        # answering at all - it can still decline cleanly with no series.
+        logger.warning("Could not list series for the assistant", exc_info=True)
+        return []
 
 
 def _mentioned_series(question: str, series_list) -> list:
-    """If the question names a specific location and/or department (e.g. "the
-    cafe", "community hospital", "the cafe at Regional Medical"), scope facts
-    to just those series instead of dumping all 4 - keeps answers on-topic and
-    short. Falls back to every series when nothing specific is named."""
-    departments = _alias_hits(question, _DEPARTMENT_ALIASES)
-    locations = _alias_hits(question, _LOCATION_ALIASES)
-    if not departments and not locations:
+    """Scope a question to the series it names.
+
+    The vocabulary comes from the series' own labels, so it adapts to
+    whatever the client called their groups. Falls back to every series when
+    nothing specific is named - a general question should see everything.
+    """
+    if not series_list:
+        return []
+    aliases = _discriminating_aliases(_series_aliases(series_list))
+    hits = _alias_hits(question, aliases)
+    if not hits:
         return list(series_list)
-    matched = [
-        s for s in series_list
-        if (not departments or any(d in s.key for d in departments))
-        and (not locations or s.location_id in locations)
-    ]
+    matched = [s for s in series_list if s.key in hits]
     return matched or list(series_list)
 
 
@@ -185,20 +277,57 @@ def forecast_facts(db: Session, question: str = "", visual: bool = False, chart_
         return {"status": "No training run yet - Labor Forecasting has not been trained."}
 
     from app.services.forecasting import workspace
-    from app.services.forecasting.contract import SERIES
 
-    scoped_series = _mentioned_series(question, SERIES)
+    series_list = all_series(db)
+    scoped_series = _mentioned_series(question, series_list)
     scoped_keys = {s.key for s in scoped_series}
+    # Uploaded series are trained by their own job, so filtering champions to
+    # the latest job id would drop every one of them. Match on the champion
+    # flag per series instead, which is set once selection completes for
+    # whichever job trained it.
     champions = db.execute(
-        select(ModelRun).where(ModelRun.job_id == job.job_id, ModelRun.is_champion.is_(True), ModelRun.series_key.in_(scoped_keys))
+        select(ModelRun).where(ModelRun.is_champion.is_(True), ModelRun.series_key.in_(scoped_keys))
     ).scalars().all()
 
     staffing = []
     for series in scoped_series:
-        # A chart needs more than the latest point to draw a line.
-        impact = workspace.get_staffing_impact(db, series.key, days=14 if visual else 1)
-        if impact.get("points"):
-            staffing.append({"series": series.label, **impact["points"][-1]})
+        try:
+            impact = workspace.get_staffing_impact(db, series.key, days=14)
+        except LookupError:
+            # An uploaded series with no companion file has no planned curve
+            # to compare against - that is expected, not an error.
+            continue
+        points = impact.get("points") or []
+        if not points:
+            continue
+        # The whole outlook, not one arbitrary period. This used to hand over
+        # points[-1] alone, so a horizon with three short weeks in it was
+        # summarised by whichever week happened to fall last - and the
+        # assistant answered "no site is short" while the recommendations
+        # page listed the shortfalls. One page contradicting another is worse
+        # than either being wrong on its own.
+        outlook = impact.get("outlook") or {}
+        ahead = [p for p in points if p.get("is_forecast") and p.get("gap") is not None]
+        worst = min(ahead, key=lambda p: p["gap"]) if ahead else None
+        latest = points[-1]
+        staffing.append({
+            "series": series.label,
+            "measured_in": impact.get("required_label"),
+            "periods_ahead": outlook.get("periods"),
+            "periods_short_ahead": outlook.get("short_periods"),
+            "cover_to_find": outlook.get("total_shortfall"),
+            "worst_period": None if worst is None else worst["date"],
+            "worst_gap": None if worst is None else worst["gap"],
+            # Named for their scope, not left to a reading rule. A field
+            # called "status" beside a horizon summary gets answered from,
+            # however clearly the prompt says otherwise - so the name itself
+            # now says it describes one period.
+            "latest_period": latest["date"],
+            "required_in_latest_period": latest["required_headcount"],
+            "planned_in_latest_period": latest["scheduled_headcount"],
+            "gap_in_latest_period": latest["gap"],
+            "status_in_latest_period": latest["status"],
+        })
 
     # Hour-of-day/day-of-week/seasonal pattern, folded in from the Data
     # Analysis tab so "why does demand peak at 7am?"-style questions are
@@ -221,7 +350,8 @@ def forecast_facts(db: Session, question: str = "", visual: bool = False, chart_
             }, chart_type)
 
     horizon = detect_forecast_horizon(question)
-    label_by_key = {s.key: s.label for s in SERIES}
+    label_by_key = {s.key: s.label for s in series_list}
+    ref_by_key = {s.key: s for s in series_list}
 
     def _horizon_forecast(c: ModelRun) -> dict:
         trend = _trend_for_run(db, c)
@@ -234,11 +364,11 @@ def forecast_facts(db: Session, question: str = "", visual: bool = False, chart_
         # monthly/quarterly: the model is only validated to 7 days ahead: this
         # is a historical-average projection, not a trained/validated
         # forecast, and must be presented as such.
-        from app.services.forecasting.contract import SLOTS_PER_DAY
-
         window_days = 30 if horizon == "monthly" else 90
         pct_change = trend["pct_change"] if trend else None
-        projected = _project_from_history(db, c, window_days * SLOTS_PER_DAY, pct_change)
+        projected = _project_from_history(
+            db, c, window_days * _periods_per_day(db, c.series_key), pct_change
+        )
         return {
             "horizon": horizon, "basis": "historical seasonal projection - NOT a validated forecast",
             "projected_avg": projected,
@@ -250,140 +380,22 @@ def forecast_facts(db: Session, question: str = "", visual: bool = False, chart_
     facts = {
         # Tells the model whether it is looking at one named site or all of
         # them, so it does not describe a scoped answer as company-wide.
-        "scope": [s.label for s in scoped_series] if len(scoped_series) < len(SERIES) else "all sites and departments",
+        "scope": [s.label for s in scoped_series] if len(scoped_series) < len(series_list) else "everything loaded",
         "requested_horizon": horizon,
         "champions": [
             {
                 "series": label_by_key.get(c.series_key, c.series_key), "model": c.model_label,
                 "mape": c.mape, "accuracy": c.accuracy, "trend": _trend_for_run(db, c),
                 "forecast_at_requested_horizon": _horizon_forecast(c),
+                # Carried per series so the answer states this series' own
+                # unit rather than the built-in schema's.
+                "unit": series_unit(db, ref_by_key.get(c.series_key)) if ref_by_key.get(c.series_key) else "units",
             }
             for c in champions
         ],
-        "latest_staffing_gap": staffing,
+        "staffing_outlook": staffing,
         "demand_pattern": demand_pattern,
     }
-    if chart:
-        facts["chart"] = chart
-    return facts
-
-
-def labor_cost_facts(db: Session, question: str = "", visual: bool = False, chart_type: str | None = None) -> dict:
-    from app.services.analytics import labor_analytics
-
-    summary = labor_analytics.compute(db)
-    if summary.get("error"):
-        return {"status": summary["error"]}
-    # The full per-department rows, ranked worst-to-best on budget variance.
-    # Without these, a "which department is worst on cost?" question had only
-    # the company-wide KPI total to work from and could not be answered.
-    departments = sorted(
-        (
-            {
-                "location": m["location_name"], "department": m["department_name"],
-                "labor_cost": m["labor_cost"], "vs_budget_pct": m["labor_cost_vs_budget_pct"],
-                "overtime_pct_of_hours": m["overtime_control_pct"],
-                "schedule_adherence_pct": m["schedule_adherence_pct"],
-                "headcount": m["headcount"], "hours_worked": m["actual_hours"],
-                "scorecard_rank": m["rank"],
-            }
-            for m in summary["manager_performance"]
-        ),
-        key=lambda d: d["vs_budget_pct"] if d["vs_budget_pct"] is not None else -999,
-        reverse=True,
-    )
-    facts = {
-        "scope": _scope_label(question),
-        "window": summary.get("window"),
-        "kpis": summary["kpis"],
-        "departments_ranked_by_budget_variance": departments,
-        "over_budget_departments": [d for d in departments if (d["vs_budget_pct"] or 0) > 10],
-    }
-    if visual and summary["labor_cost"].get("trend"):
-        facts["chart"] = apply_chart_type({
-            "type": "line", "title": "Labor cost trend", "x_key": "date",
-            "series": [{"key": "cost", "label": "Cost"}], "data": summary["labor_cost"]["trend"],
-        }, chart_type)
-    return facts
-
-
-def punch_facts(db: Session, question: str = "", visual: bool = False, chart_type: str | None = None) -> dict:
-    from app.services.punch_analytics import rules
-
-    result = rules.detect_anomalies(db)
-    if result.get("error"):
-        return {"status": result["error"]}
-    anomalies = result.get("anomalies") or []
-    # Which exception types actually drive the exception rate, plus the named
-    # repeat offenders - a "who keeps missing punches?" question needs rows,
-    # not just the KPI count.
-    by_type: dict[str, int] = {}
-    by_employee: dict[str, dict] = {}
-    for a in anomalies:
-        by_type[a["exception_type"]] = by_type.get(a["exception_type"], 0) + 1
-        entry = by_employee.setdefault(a["employee_id"], {
-            "employee": a["employee_name"], "location": a["location_name"], "department": a["department_name"],
-            "location_id": a["location_id"], "department_id": a["department_id"], "exceptions": 0,
-        })
-        entry["exceptions"] += 1
-    flagged = _scope_employees(question, sorted(by_employee.values(), key=lambda e: -e["exceptions"]))
-    exceptions_by_type = dict(sorted(by_type.items(), key=lambda kv: -kv[1]))
-    facts = {
-        "scope": _scope_label(question),
-        "window": result.get("window"),
-        "kpis": result["kpis"],
-        "total_exceptions": len(anomalies),
-        "exceptions_by_type": exceptions_by_type,
-        # The ids exist only to drive the scoping above; the names carry the
-        # same information for a reader.
-        "most_flagged_employees": [{k: v for k, v in e.items() if not k.endswith("_id")} for e in flagged[:5]],
-    }
-    if visual and exceptions_by_type:
-        facts["chart"] = apply_chart_type({
-            "type": "bar", "title": "Punch issues by type", "x_key": "type",
-            "series": [{"key": "count", "label": "Issues"}],
-            "data": [{"type": k, "count": v} for k, v in exceptions_by_type.items()],
-        }, chart_type)
-    return facts
-
-
-def risk_facts(db: Session, question: str = "", visual: bool = False, chart_type: str | None = None) -> dict:
-    from app.services.predictions import engine as predictions_engine
-
-    result = predictions_engine.compute_all(db)
-    summary = []
-    chart = None
-    for m in result["employee_models"]:
-        if m.get("status") == "completed":
-            high = [e for e in m["employees"] if e["risk_level"] == "High"]
-            scoped = _scope_employees(question, m["employees"])
-            highest = [
-                {
-                    "employee": e["employee_name"], "location": e["location_name"],
-                    "department": e["department_name"], "risk_pct": round(e["risk_probability"] * 100),
-                    "risk_level": e["risk_level"],
-                }
-                for e in scoped[:5]
-            ]
-            summary.append({
-                "model": m["model_label"],
-                "high_risk_employee_count": len(high),
-                "roc_auc": m["metrics"]["roc_auc"],
-                # Named employees, so "who is most at risk?" is answerable from
-                # the facts instead of only "how many". Already sorted by
-                # descending risk by the prediction service.
-                "highest_risk_employees": highest,
-                "top_drivers": m.get("top_drivers"),
-            })
-            if visual and chart is None and highest:
-                chart = apply_chart_type({
-                    "type": "bar", "title": f"{m['model_label']} - highest risk employees", "x_key": "employee",
-                    "series": [{"key": "risk_pct", "label": "Risk %"}],
-                    "data": [{"employee": e["employee"], "risk_pct": e["risk_pct"]} for e in highest],
-                }, chart_type)
-        else:
-            summary.append({"model": m["model_id"], "status": "not_applicable", "reason": m.get("reason")})
-    facts = {"risk_models": summary, "turnover_risk": result["turnover_risk"]["reason"]}
     if chart:
         facts["chart"] = chart
     return facts
@@ -414,12 +426,11 @@ def recommendation_facts(db: Session, question: str = "", visual: bool = False, 
 
 def model_performance_facts(db: Session, question: str = "", visual: bool = False, chart_type: str | None = None) -> dict:
     forecast = forecast_facts(db, question, visual=False)
-    from app.services.predictions import engine as predictions_engine
-
-    predictive = predictions_engine.compute_all(db)
-    classifier_metrics = [{"model": m["model_label"], "metrics": m.get("metrics"), "top_drivers": m.get("top_drivers")} for m in predictive["employee_models"] if m.get("status") == "completed"]
     champions = forecast.get("champions") or []
-    facts = {"forecast_champions": champions, "predictive_models": classifier_metrics}
+    # The employee-level classifiers (overtime, absenteeism, adherence) went
+    # with the canonical schema - they were trained on per-worker punch and
+    # timecard rows, which an uploaded forecasting file does not contain.
+    facts = {"forecast_champions": champions}
     if visual and champions:
         facts["chart"] = apply_chart_type({
             "type": "bar", "title": "Champion MAPE by series", "x_key": "series",
@@ -454,11 +465,10 @@ def data_quality_facts(db: Session, question: str = "", visual: bool = False, ch
 
 def drift_facts(db: Session, question: str = "", visual: bool = False, chart_type: str | None = None) -> dict:
     from app.services.forecasting import workspace
-    from app.services.forecasting.contract import SERIES
 
     results = []
     chart = None
-    for series in _mentioned_series(question, SERIES):
+    for series in _mentioned_series(question, all_series(db)):
         try:
             d = workspace.get_drift(db, series.key, None)
         except LookupError:
@@ -482,11 +492,13 @@ def drift_facts(db: Session, question: str = "", visual: bool = False, chart_typ
     return facts
 
 
+# Only the tools that can be answered from an uploaded file. The labor
+# cost, punch and per-employee risk tools are gone with the Sodexo schema:
+# they read pay rates, punch records and employee rows, which a forecasting
+# file does not carry, and answering them from nothing would mean inventing
+# figures.
 TOOLS = {
     "forecast": forecast_facts,
-    "labor_cost": labor_cost_facts,
-    "punch": punch_facts,
-    "risk": risk_facts,
     "recommendations": recommendation_facts,
     "model_performance": model_performance_facts,
     "data_quality": data_quality_facts,
@@ -497,9 +509,6 @@ TOOLS = {
 # keyword overlap. Keep in step with TOOLS.
 TOOL_DESCRIPTIONS = {
     "forecast": "labor demand forecast, forecast trend and direction, required vs scheduled headcount, staffing gaps, under/overstaffed shifts, demand patterns by hour or day",
-    "labor_cost": "labor cost, spend against budget, per-department budget variance, overtime hours and cost, hours worked, headcount",
-    "punch": "clock-in/clock-out punches, missed punches, late arrivals, buddy punching, timecard exceptions, attendance anomalies",
-    "risk": "per-employee predictive risk scores and who is highest risk: overtime risk, absenteeism risk, schedule adherence risk, payroll anomaly risk, turnover",
     "recommendations": "the ranked list of recommended actions to take now, what to prioritise, what needs immediate attention, estimated savings",
     "model_performance": "how accurate or trustworthy the models are: champion model per series, backtest accuracy, MAPE, ROC-AUC, feature drivers",
     "data_quality": "data ingestion health, which source systems loaded cleanly, records received/loaded/rejected, freshness of the data",
@@ -525,27 +534,6 @@ _CAPABILITY_PHRASES = (
 # question that hits nothing is declined rather than answered with whatever
 # matched first.
 _TOPIC_TERMS: dict[str, tuple[str, ...]] = {
-    "labor_cost": (
-        "cost", "costs", "budget", "budgets", "spend", "spending", "expense", "expenses",
-        "payroll", "overtime", "over time", "ot hours", "utilisation", "utilization",
-        "cost per hour", "under budget", "over budget", "money", "dollars",
-    ),
-    "forecast": (
-        "forecast", "forecasts", "forecasting", "demand", "staffing gap", "staff gap",
-        "required", "understaffed", "overstaffed", "short of staff", "shortfall",
-        "trend", "trending", "graph", "chart", "pattern", "rising", "falling",
-        "increase", "increasing", "decrease", "decreasing",
-        "how many staff", "headcount", "roster", "rota", "schedule", "scheduled",
-        "staff", "staffing", "cover", "shift", "shifts",
-        # Deliberately NOT "tomorrow" / "next week" on their own - "what's the
-        # weather tomorrow" was matching forecast on the date word alone.
-    ),
-    "punch": (
-        "punch", "punches", "punching", "attendance", "late", "lateness", "missed",
-        "anomaly", "anomalies", "buddy", "clock in", "clock out", "clocking",
-        "exception", "exceptions", "absent", "absence", "absenteeism", "timecard",
-    ),
-    "risk": ("risk", "risks", "risky", "at risk", "turnover", "attrition", "likely to", "predict", "prediction"),
     "recommendations": (
         "recommend", "recommends", "recommended", "recommendation", "recommendations",
         "action", "actions", "should i", "what should", "how should", "how do i",
@@ -575,7 +563,7 @@ _OVERVIEW_PHRASES = (
     "overview", "summary", "summarise", "summarize", "everything", "overall",
     "how are we doing", "state of play", "full picture", "brief me", "walk me through",
 )
-_OVERVIEW_TOPICS = ["recommendations", "forecast", "labor_cost"]
+_OVERVIEW_TOPICS = ["recommendations", "forecast", "model_performance"]
 
 
 def _words(text: str) -> list[str]:
@@ -655,69 +643,43 @@ def is_follow_up(question: str) -> bool:
     return not select_tools(question)
 
 
-_EMPTY_SCOPE = {"location_id": None, "location_name": None, "department_id": None, "department_name": None}
-
-
-def detect_scope(question: str) -> dict:
-    """What site/department the question itself names, explicitly.
-
-    `None` for a dimension the question doesn't name, or names ambiguously
-    (both locations, both departments at once) - ambiguous means "not
-    stated", never an arbitrary pick. Uses the alias-internal codes
-    (LOC01/LOC02/CAFE/FOOD_NUTRITION), the same code space _SCOPE_NAMES and
-    _alias_hits already speak - not dim_department's DEP01/DEP02.
-    """
-    locs = _alias_hits(question, _LOCATION_ALIASES)
-    deps = _alias_hits(question, _DEPARTMENT_ALIASES)
-    loc = next(iter(locs)) if len(locs) == 1 else None
-    dep = next(iter(deps)) if len(deps) == 1 else None
-    return {
-        "location_id": loc, "location_name": _SCOPE_NAMES.get(loc),
-        "department_id": dep, "department_name": _SCOPE_NAMES.get(dep),
-    }
+_EMPTY_SCOPE = {"series_keys": []}
 
 
 def merge_scope(question: str, current_scope: dict | None, history: list[dict] | None = None) -> dict:
-    """The scope to carry into this turn's answer, and to hand back to the
-    frontend to round-trip on the next one.
+    """Carry the previous turn's series scope into a follow-up.
 
-    A site/department named in the current question always wins for that
-    dimension. Otherwise, the previous turn's value for that dimension
-    carries forward only when this question reads as a follow-up ("why?",
-    "what about there?") - a self-contained new question ("which department
-    is over budget?") resets to company-wide instead of dragging a stale
-    scope from several turns ago, which is the failure mode the old
-    text-concatenation approach had past one hop.
+    Scope is now a list of series keys rather than a site/department pair,
+    because with uploaded data there is no fixed dimension to scope on. A
+    question that names a series wins; otherwise a follow-up ("why?", "what
+    about there?") inherits the previous turn's series, and a self-contained
+    question resets to everything.
     """
-    explicit = detect_scope(question)
     current_scope = current_scope or {}
     carry = is_follow_up(question) or bool(set(_words(question)) & _REFERENTIAL_WORDS)
-    merged = {}
-    for dim in ("location", "department"):
-        id_key, name_key = f"{dim}_id", f"{dim}_name"
-        if explicit[id_key]:
-            merged[id_key], merged[name_key] = explicit[id_key], explicit[name_key]
-        elif carry and current_scope.get(id_key):
-            merged[id_key], merged[name_key] = current_scope[id_key], current_scope.get(name_key)
-        else:
-            merged[id_key], merged[name_key] = None, None
-    return merged
+    if carry and current_scope.get("series_keys"):
+        return {"series_keys": list(current_scope["series_keys"])}
+    return {"series_keys": []}
+
+
+def scope_from_series(matched, series_list) -> dict:
+    """The scope to persist after answering, for the next turn to inherit."""
+    if not matched or len(matched) >= len(series_list):
+        return {"series_keys": []}
+    return {"series_keys": [s.key for s in matched]}
 
 
 def scoping_text_from_scope(question: str, scope: dict | None) -> str:
-    """The text the fact tools read for site/department scoping - the
-    persisted scope's names, prepended ahead of the question, so the
-    existing _alias_hits-based helpers inside each tool pick them up
-    unchanged. An explicit mention in `question` itself still wins, because
-    merge_scope already gave it priority when building `scope`."""
-    if not scope:
+    """Prefix the question with the carried series' names.
+
+    The fact tools scope by matching words against series labels, so the
+    cheapest way to apply an inherited scope is to put those labels in front
+    of the question and let the existing matching pick them up.
+    """
+    keys = (scope or {}).get("series_keys") or []
+    if not keys:
         return question
-    prefix = " ".join(filter(None, [scope.get("location_name"), scope.get("department_name")]))
-    return f"{prefix} {question}".strip() if prefix else question
-
-
-_VISUAL_WORDS = {"chart", "graph", "plot", "visual", "picture"}
-_VISUAL_PHRASES = ("trend line", "show me", "over time")
+    return f"{' '.join(keys)} {question}"
 
 
 _CHART_TYPE_PHRASES: dict[str, tuple[str, ...]] = {
@@ -726,10 +688,11 @@ _CHART_TYPE_PHRASES: dict[str, tuple[str, ...]] = {
     "donut": ("donut", "doughnut", "pie chart", "pie graph"),
 }
 
-# "piechart", "bargraph", "linechart" etc. are typed as one word as often as
-# two - split them apart before matching so the phrase lists above don't need
-# a duplicate compound-word entry for every combination.
-_COMPOUND_CHART_WORD = re.compile(r"\b(pie|bar|line|donut|doughnut|column)(chart|graph|plot)s?\b")
+_VISUAL_WORDS = {"chart", "graph", "plot", "visual", "picture"}
+_VISUAL_PHRASES = ("trend line", "show me", "over time")
+# "barchart" and "bar chart" mean the same thing; split the compound so the
+# word-set match below sees "chart" either way.
+_COMPOUND_CHART_WORD = re.compile(r"(pie|bar|line|donut|doughnut|column)(chart|graph|plot)s?")
 
 
 def _normalize_chart_words(question: str) -> str:

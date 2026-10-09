@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { LoadingState, ErrorState } from '../layout/PageContainer'
+import { LoadingState, ErrorState, EmptyState } from '../layout/PageContainer'
 import { Card, Badge, KpiCard } from '../ui/Card'
 import { fetchPreprocessing, type PreprocessingResponse } from '../../services/api'
 
@@ -32,19 +32,42 @@ function PreviewTable({ columns, rows }: { columns: string[]; rows: Record<strin
   )
 }
 
-export function DataPreprocessingTab({ seriesKey }: { seriesKey: string }) {
+export function DataPreprocessingTab({ seriesKey, seriesLoading }: { seriesKey: string; seriesLoading?: boolean }) {
   const [data, setData] = useState<PreprocessingResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
     if (!seriesKey) return
+    let stale = false
     setData(null)
     setError(null)
-    fetchPreprocessing(seriesKey).then(setData).catch((err) => setError(err?.response?.data?.detail ?? String(err)))
+    fetchPreprocessing(seriesKey)
+      .then((d) => !stale && setData(d))
+      .catch((err) => !stale && setError(err?.response?.data?.detail ?? String(err)))
+    return () => {
+      stale = true
+    }
   }, [seriesKey])
 
-  if (error) return <ErrorState message={error} />
-  if (!data) return <LoadingState />
+  // A mapping that is wrong produces no series at all, so seriesKey is empty
+  // and there is nothing to preprocess. Say so rather than spinning forever;
+  // the mapping itself is corrected under Demand Drivers & Feature Mapping.
+  if (seriesLoading) return <LoadingState />
+  if (!seriesKey) {
+    return (
+      <EmptyState message="No data yet. Upload a CSV or Excel file on the Data Quality page - this page reads it as soon as it is mapped." />
+    )
+  }
+  if (error) {
+    return (
+      <ErrorState message={error} />
+    )
+  }
+  if (!data) {
+    return (
+      <LoadingState />
+    )
+  }
 
   return (
     <div className="flex flex-col gap-5">
@@ -53,7 +76,7 @@ export function DataPreprocessingTab({ seriesKey }: { seriesKey: string }) {
         <p className="mb-3 text-xs text-[var(--color-text-muted)]">Current values for this series.</p>
         <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
           <KpiCard label="Total History Available" value={`${data.total_history_days.toLocaleString()}d`} sublabel="days of history" />
-          <KpiCard label="Training Window Used" value={`${data.training_window_days}d`} sublabel={`${data.training_window_rows} half-day rows`} />
+          <KpiCard label="Training Window Used" value={`${data.training_window_days}d`} sublabel={`${data.training_window_rows} ${(data.period_label ?? "").toLowerCase() || "period"} rows`} />
           <KpiCard label="Resolved Seasonality" value={data.seasonal_period_label} />
           <KpiCard label="Forecast Horizon" value={`${data.forecast_horizon_days}d ahead`} sublabel={`${data.block_hours}-hour blocks`} />
           <KpiCard label="Input Data Used" value={`${data.input_dataset.rows} × ${data.input_dataset.columns}`} sublabel="rows × columns fed into training" />
@@ -71,7 +94,7 @@ export function DataPreprocessingTab({ seriesKey }: { seriesKey: string }) {
 
       <Card>
         <div className="mb-2 flex items-center justify-between">
-          <h3 className="text-xs font-semibold text-[var(--color-text)]">Input data preview - first 10 rows (one row = one half-day block)</h3>
+          <h3 className="text-xs font-semibold text-[var(--color-text)]">Input data preview - first 10 rows (one row = one {(data.period_label ?? "period").toLowerCase()} period)</h3>
           <span className="text-[11px] text-[var(--color-text-muted)]">{data.input_dataset.rows} rows × {data.input_dataset.columns} columns total</span>
         </div>
         <PreviewTable columns={data.preview_columns} rows={data.preview_rows} />

@@ -36,6 +36,7 @@ class ModelContext:
         xgb_rollings: tuple[int, ...] = XGB_ROLLING_SLOTS,
         max_seasonal_period: int = AUTO_ARIMA_MAX_SEASONAL_PERIOD,
         var_pair_reason: str | None = None,
+        state_space_seasonal_period: int | None = None,
     ):
         self.seasonal_period = seasonal_period
         self.exog_columns = exog_columns
@@ -44,6 +45,16 @@ class ModelContext:
         self.xgb_lags = xgb_lags
         self.xgb_rollings = xgb_rollings
         self.max_seasonal_period = max_seasonal_period
+        # The period the state-space models may use. SARIMAX and Exponential
+        # Smoothing carry one state per seasonal slot, so their cost grows with
+        # the SQUARE of the period: a weekly cycle on hourly data is 168 slots
+        # and a single fit does not finish in any time a person will wait -
+        # the run sat at 0 of 52 for minutes with nothing to show. Capped here
+        # and left to XGBoost, whose 168-slot lag features carry the weekly
+        # shape at a cost that does not explode.
+        self.state_space_seasonal_period = (
+            seasonal_period if state_space_seasonal_period is None else state_space_seasonal_period
+        )
         # Why this series has no second series for VAR, when that is knowable
         # up front (an uploaded file with no driver column chosen).
         self.var_pair_reason = var_pair_reason
@@ -117,7 +128,7 @@ def fit_sarimax(train_df, output_df, ctx: ModelContext, use_exog: bool):
 
     _require_rows(train_df, 12, "SARIMAX")
     exog_train, exog_future = _exog_pair(train_df, output_df, ctx.exog_columns) if use_exog else (None, None)
-    period = ctx.seasonal_period
+    period = ctx.state_space_seasonal_period
     # A real seasonal component (weekly AR + MA terms). This used to be
     # (0,0,0,period) - every seasonal term zero, which made "SARIMAX" a plain
     # ARIMA(2,1,1) with no weekly structure at all. The exog variant hid the
@@ -143,15 +154,25 @@ def fit_auto_arima(train_df, output_df, ctx: ModelContext, use_exog: bool):
 
     _require_rows(train_df, 24, "Auto ARIMA")
     x_train, x_future = _exog_pair(train_df, output_df, ctx.exog_columns) if use_exog else (None, None)
-    period = ctx.seasonal_period
+    period = ctx.state_space_seasonal_period
     seasonal = bool(period and period <= ctx.max_seasonal_period and len(train_df) >= period * 2)
-    # A wider order search than the hourly grain could afford - a daily series
-    # is ~24x shorter, so the stepwise search is cheap here and the extra
-    # flexibility matters when an exogenous matrix is also in play.
+    # The seasonal half of this search is what it costs. An earlier comment
+    # here claimed the stepwise search was cheap because a daily series is
+    # short; measured at half-day grain with m=14 it took 106s for a single
+    # fit - by far the slowest thing in the portfolio, and on its own enough
+    # to blow the documented training time.
+    #
+    # max_P/max_Q are capped at 1 rather than 2. A seasonal term beyond first
+    # order means "the same block two weeks ago still matters after
+    # accounting for one week ago" - real but rare, and every extra order
+    # multiplies the candidates the stepwise search must fit at lag m. max_d
+    # drops to 1 for the same reason: a second non-seasonal difference on an
+    # already-stationary staffing series mostly buys candidates that lose on
+    # AICc anyway.
     model = pm.auto_arima(
-        train_df["target"].astype(float), X=x_train, start_p=1, start_q=1, max_p=3, max_q=3, max_d=2,
-        m=period if seasonal else 1, seasonal=seasonal, D=0 if seasonal else None, max_P=2, max_D=1, max_Q=2,
-        max_order=8, information_criterion="aicc",
+        train_df["target"].astype(float), X=x_train, start_p=1, start_q=1, max_p=3, max_q=3, max_d=1,
+        m=period if seasonal else 1, seasonal=seasonal, D=0 if seasonal else None, max_P=1, max_D=1, max_Q=1,
+        max_order=6, information_criterion="aicc",
         error_action="ignore", suppress_warnings=True, stepwise=True, trace=False,
     )
     return _clean_predictions(model.predict(n_periods=len(output_df), X=x_future), len(output_df))
@@ -248,7 +269,7 @@ def fit_exp_smoothing(train_df, output_df, ctx: ModelContext, seasonal: str, dam
     y = pd.Series(train_df["target"].astype(float).values)
     if seasonal == "mul" and (y <= 0).any():
         raise ValueError("Multiplicative smoothing requires strictly positive target values.")
-    period = ctx.seasonal_period
+    period = ctx.state_space_seasonal_period
     if not period or len(y) < period * 2:
         raise ValueError("Exponential Smoothing requires at least two complete seasonal cycles.")
     try:

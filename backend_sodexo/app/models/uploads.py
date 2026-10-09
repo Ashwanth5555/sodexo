@@ -34,7 +34,11 @@ class UploadedDataset(Base):
     # --- the user's mapping of this file onto a time series -----------------
     date_column: Mapped[str | None] = mapped_column(String(120), nullable=True)
     target_column: Mapped[str | None] = mapped_column(String(120), nullable=True)
-    group_column: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    # One column, or several. Several means the series are the COMBINATIONS
+    # that actually occur - region x department gives one series per real
+    # pairing, not per region and per department separately. Stored as a
+    # list; a single-column grouping is just a list of one.
+    group_columns: Mapped[list | None] = mapped_column(JSON, nullable=True)
     # Pandas offset alias: H, D, W, MS. Drives resampling and seasonality.
     frequency: Mapped[str | None] = mapped_column(String(8), nullable=True)
     # How duplicate rows in the same period are combined: sum or mean.
@@ -46,3 +50,23 @@ class UploadedDataset(Base):
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     configured_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    # --- optional planned/capacity column ------------------------------
+    #
+    # Staffing Impact compares what is forecast against what was planned.
+    # That second value comes from another column of THIS file - there is no
+    # second upload. Null when the client's file only records demand, in
+    # which case the tab says so rather than inventing a comparison.
+    capacity_column: Mapped[str | None] = mapped_column(String(120), nullable=True)
+
+    # How the mapping was decided: "llm" or "heuristic". Shown in the UI so
+    # the client knows whether a model read their columns or a rule did, and
+    # how carefully to check the result.
+    mapping_source: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    mapping_reasoning: Mapped[str | None] = mapped_column(String(400), nullable=True)
+
+    # What the reader had to do to the file before it was usable: a header
+    # found below row 1, a pivot reshaped, a totals row dropped, currency
+    # symbols stripped, a notes sheet ignored. Shown on Data Quality so a
+    # client can always check the app read their file the way they meant it.
+    cleaning_notes: Mapped[list | None] = mapped_column(JSON, nullable=True)

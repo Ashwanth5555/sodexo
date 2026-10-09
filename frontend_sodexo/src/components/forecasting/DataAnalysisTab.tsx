@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Bar, BarChart, CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
-import { LoadingState, ErrorState } from '../layout/PageContainer'
+import { LoadingState, ErrorState, EmptyState } from '../layout/PageContainer'
 import { Card } from '../ui/Card'
 import { fetchEda, type EdaResponse } from '../../services/api'
 
@@ -21,19 +21,6 @@ function TrendChart({ data }: { data: EdaResponse['daily_trend'] }) {
   )
 }
 
-function CurveChart({ data }: { data: { label: string; value: number }[] }) {
-  return (
-    <ResponsiveContainer width="100%" height={200}>
-      <LineChart data={data}>
-        <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border)" />
-        <XAxis dataKey="label" tick={{ fontSize: 10, fill: 'var(--color-text-muted)' }} />
-        <YAxis tick={{ fontSize: 10, fill: 'var(--color-text-muted)' }} />
-        <Tooltip contentStyle={{ background: 'var(--color-surface)', border: '1px solid var(--color-border)', fontSize: 12 }} />
-        <Line type="monotone" dataKey="value" name="Average demand" stroke="#c2410c" strokeWidth={2} dot={{ r: 2 }} />
-      </LineChart>
-    </ResponsiveContainer>
-  )
-}
 
 function CompareBarChart({ data }: { data: { label: string; value: number }[] }) {
   return (
@@ -70,11 +57,6 @@ function extremes(data: { label: string; value: number }[]) {
   return { max, min }
 }
 
-function hourInsight(data: { label: string; value: number }[]): string {
-  if (!data.length) return ''
-  const { max, min } = extremes(data)
-  return `Busiest at ${max.label} (${max.value}) · quietest at ${min.label} (${min.value}).`
-}
 
 function dowInsight(data: { label: string; value: number }[]): string {
   if (!data.length) return ''
@@ -101,20 +83,33 @@ function LiftChip({ label, pct }: { label: string; pct: number | null }) {
   )
 }
 
-export function DataAnalysisTab({ seriesKey }: { seriesKey: string }) {
+export function DataAnalysisTab({ seriesKey, seriesLoading }: { seriesKey: string; seriesLoading?: boolean }) {
   const [eda, setEda] = useState<EdaResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
     if (!seriesKey) return
+    let stale = false
     setEda(null)
-    fetchEda(seriesKey).then(setEda).catch((err) => setError(err?.response?.data?.detail ?? String(err)))
+    // Cleared here, not just on success. Leaving a previous series' error in
+    // place made it permanent: a key that had gone stale failed once, and the
+    // message stayed on screen through every later series that loaded fine.
+    setError(null)
+    fetchEda(seriesKey)
+      .then((d) => !stale && setEda(d))
+      .catch((err) => !stale && setError(err?.response?.data?.detail ?? String(err)))
+    return () => {
+      stale = true
+    }
   }, [seriesKey])
 
+  // Three states, not two. An empty picker is not the same as a request in
+  // flight, and folding them together left this page on "Loading data..."
+  // forever whenever there was no series to pick.
+  if (seriesLoading) return <LoadingState />
+  if (!seriesKey) return <EmptyState message="No data yet. Upload a CSV or Excel file on the Data Quality page - this page reads it as soon as it is mapped." />
   if (error) return <ErrorState message={error} />
   if (!eda) return <LoadingState />
-
-  const byHour = Object.entries(eda.by_hour_of_day).map(([h, v]) => ({ label: `${h}:00`, value: v })).sort((a, b) => Number(a.label.replace(':00', '')) - Number(b.label.replace(':00', '')))
   const byDow = Object.entries(eda.by_day_of_week).map(([d, v]) => ({ label: DOW_LABELS[Number(d)] ?? d, value: v }))
   const season = Object.entries(eda.season_effect).map(([k, v]) => ({ label: k, value: v }))
 
@@ -126,12 +121,11 @@ export function DataAnalysisTab({ seriesKey }: { seriesKey: string }) {
         <Insight>{trendInsight(eda.daily_trend)}</Insight>
       </Card>
 
+      {/* The hour-of-day curve is gone. It only says something when the file
+          is hourly; on daily data every row falls in hour zero, so the chart
+          was a single dot above "busiest at 0:00, quietest at 0:00" - which
+          reads as a broken chart rather than as "this grain has no hours". */}
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-        <Card>
-          <h3 className="mb-2 text-xs font-semibold text-[var(--color-text)]">Average demand curve by hour of day</h3>
-          <CurveChart data={byHour} />
-          <Insight>{hourInsight(byHour)}</Insight>
-        </Card>
         <Card>
           <h3 className="mb-2 text-xs font-semibold text-[var(--color-text)]">Average demand by day of week</h3>
           <CompareBarChart data={byDow} />
@@ -152,6 +146,13 @@ export function DataAnalysisTab({ seriesKey }: { seriesKey: string }) {
             {Object.entries(eda.flag_effects).map(([flag, effect]) => (
               <LiftChip key={flag} label={`${flag.replace(/_/g, ' ')} on vs. off`} pct={effect.lift_pct} />
             ))}
+            {/* Every chip hides itself when its lift cannot be computed, so
+                without this the card renders as a bare heading over nothing. */}
+            {eda.holiday_lift_pct === null && Object.keys(eda.flag_effects).length === 0 && (
+              <p className="text-xs text-[var(--color-text-muted)]">
+                This series has no holiday or flag column with both states present, so there is nothing to compare.
+              </p>
+            )}
           </div>
         </Card>
       </div>

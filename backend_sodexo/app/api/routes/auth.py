@@ -28,6 +28,7 @@ class UserOut(BaseModel):
     username: str
     full_name: str
     role: str
+    job_title: str
 
 
 class LoginResponse(BaseModel):
@@ -47,7 +48,7 @@ def get_current_user(credentials: HTTPAuthorizationCredentials | None = Depends(
     user = get_user(str(payload.get("sub", "")))
     if user is None:
         raise _UNAUTHORIZED
-    return UserOut(username=user.username, full_name=user.full_name, role=user.role)
+    return UserOut(username=user.username, full_name=user.full_name, role=user.role, job_title=user.job_title)
 
 
 @router.post("/login", response_model=LoginResponse)
@@ -70,7 +71,7 @@ def login(payload: LoginRequest):
     return LoginResponse(
         access_token=token,
         expires_in=settings.auth_token_expire_minutes * 60,
-        user=UserOut(username=user.username, full_name=user.full_name, role=user.role),
+        user=UserOut(username=user.username, full_name=user.full_name, role=user.role, job_title=user.job_title),
     )
 
 

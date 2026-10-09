@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { CartesianGrid, Legend, Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
-import { LoadingState, ErrorState } from '../layout/PageContainer'
+import { LoadingState, ErrorState, EmptyState } from '../layout/PageContainer'
 import { Card, KpiCard, Badge } from '../ui/Card'
 import {
   fetchConfidence, fetchDrift, fetchDrivers, fetchEda, fetchForecast, fetchLeaderboard,
@@ -22,7 +22,7 @@ function average(values: number[]): number | null {
 }
 
 function aggregateByGranularity(data: { date: string; actual: number | null; backtest: number | null; future: number | null; isFuture: boolean }[], granularity: Granularity) {
-  // Rows are already one-per-half-day-block, so "block" needs no aggregation.
+  // Rows already arrive at the file's own period, so "block" is a no-op.
   if (granularity === 'block') return data
   const buckets = new Map<string, { actual: number[]; backtest: number[]; future: number[]; isFuture: boolean }>()
   for (const p of data) {
@@ -41,7 +41,7 @@ function aggregateByGranularity(data: { date: string; actual: number | null; bac
     }))
 }
 
-export function ForecastExplorerTab({ seriesOptions, seriesKey }: { seriesOptions: SeriesOption[]; seriesKey: string }) {
+export function ForecastExplorerTab({ seriesOptions, seriesKey, seriesLoading }: { seriesOptions: SeriesOption[]; seriesKey: string; seriesLoading?: boolean }) {
   const [availableModels, setAvailableModels] = useState<ModelRunSummary[]>([])
   const [modelId, setModelId] = useState<string>('')
   const [viewMode, setViewMode] = useState<ViewMode>('full')
@@ -86,7 +86,22 @@ export function ForecastExplorerTab({ seriesOptions, seriesKey }: { seriesOption
       .finally(() => setLoading(false))
   }, [seriesKey, modelId])
 
+  // The rollups on offer depend on the file. Hourly data can usefully be
+  // rolled to days and weeks; daily data only to weeks; weekly and monthly
+  // data to neither.
+  const nativeLabel = forecast?.frequency_label ?? 'As uploaded'
+  const coarserThanNative = {
+    daily: nativeLabel === 'Hourly',
+    weekly: nativeLabel === 'Hourly' || nativeLabel === 'Daily',
+  }
+
   const seriesDrivers = drivers?.series.find((s) => s.series_key === seriesKey)
+  // Switching series can change the file's period, so a rollup chosen for the
+  // last one may no longer be on offer.
+  useEffect(() => {
+    if (granularity === 'daily' && !coarserThanNative.daily) setGranularity('block')
+    if (granularity === 'weekly' && !coarserThanNative.weekly) setGranularity('block')
+  }, [granularity, coarserThanNative.daily, coarserThanNative.weekly])
   const champion = availableModels.find((m) => m.is_champion)
 
   const allChartData = useMemo(() => forecast?.points.map((p) => ({
@@ -189,9 +204,13 @@ export function ForecastExplorerTab({ seriesOptions, seriesKey }: { seriesOption
           <div className="flex flex-col gap-1">
             <label className="text-xs text-[var(--color-text-muted)]">Granularity</label>
             <select value={granularity} onChange={(e) => setGranularity(e.target.value as Granularity)} className="rounded-lg border border-[var(--color-border)] bg-[var(--color-surface-2)] px-3 py-1.5 text-xs text-[var(--color-text)]">
-              <option value="block">Half-day</option>
-              <option value="daily">Daily total</option>
-              <option value="weekly">Weekly average</option>
+              <option value="block">{nativeLabel}</option>
+              {/* Only the rollups that are actually coarser than the file.
+                  On daily data "Daily" and the native period are the same
+                  series under two names, and one of them claimed to be a
+                  total when the rollup averages. */}
+              {coarserThanNative.daily && <option value="daily">Daily average</option>}
+              {coarserThanNative.weekly && <option value="weekly">Weekly average</option>}
             </select>
           </div>
           {forecast && <Badge status="completed">Confidence band enabled</Badge>}
@@ -200,13 +219,22 @@ export function ForecastExplorerTab({ seriesOptions, seriesKey }: { seriesOption
 
       {loading && <LoadingState />}
       {error && <ErrorState message={error} />}
+      {/* Without this the page is three dropdowns over nothing: the body below
+          is gated on `forecast`, which never loads while there is no series to
+          ask about, and neither the loading nor the error branch applies. */}
+      {!seriesKey && !seriesLoading && !loading && !error && (
+        <EmptyState message="No trained models yet. Run Model Training, then come back here to explore the forecast." />
+      )}
 
       {forecast && !error && (
         <>
           <Card>
-            <div className="grid grid-cols-2 gap-3 text-xs md:grid-cols-4 lg:grid-cols-10">
-              <MetaField label="Target" value={forecast.target_label ?? 'required_manpower'} />
-              <MetaField label="Frequency" value={forecast.frequency_label ?? 'Half-day'} />
+            {/* Five across, not ten. A tenth of the width is about nine
+                characters, and a client's column name - required_manpower_TARGET
+                - ran straight over the field beside it. */}
+            <div className="grid grid-cols-2 gap-x-4 gap-y-3 text-xs md:grid-cols-3 lg:grid-cols-5">
+              <MetaField label="Target" value={forecast.target_label ?? '—'} />
+              <MetaField label="Frequency" value={forecast.frequency_label ?? '—'} />
               <MetaField label="Trained" value={forecast.trained_at ? forecast.trained_at.slice(0, 10) : '—'} />
               <MetaField label="Validation" value={`${forecast.evaluation_mode ?? '—'}${forecast.folds ? ` (${forecast.folds}f)` : ''}`} />
               <MetaField label="Train rows" value={forecast.train_rows != null ? String(forecast.train_rows) : '—'} />
@@ -274,9 +302,14 @@ export function ForecastExplorerTab({ seriesOptions, seriesKey }: { seriesOption
 
 function MetaField({ label, value, badge }: { label: string; value: string; badge?: string }) {
   return (
-    <div>
+    // min-w-0 lets the cell shrink inside the grid, and break-words wraps a
+    // long column name instead of letting it spill over its neighbour. The
+    // title carries the full text for anything still too long to show.
+    <div className="min-w-0">
       <div className="text-[10px] uppercase tracking-wide text-[var(--color-text-muted)]">{label}</div>
-      <div className="text-xs text-[var(--color-text)]">{value} {badge && <Badge status="champion">{badge}</Badge>}</div>
+      <div className="break-words text-xs text-[var(--color-text)]" title={value}>
+        {value} {badge && <Badge status="champion">{badge}</Badge>}
+      </div>
     </div>
   )
 }

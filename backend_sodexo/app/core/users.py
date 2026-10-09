@@ -1,9 +1,14 @@
-"""The three application logins.
+"""The application logins.
 
 POC scope: the user directory is a fixed, in-code list rather than a database
-table, so there is no signup/admin-user flow to maintain. Passwords are read
-from settings (env-overridable) and hashed once at import time - nothing is
-compared in plain text at request time.
+table, so there is no signup or user-admin flow to maintain. Passwords come
+from settings (env-overridable) and are hashed once at import time - nothing
+is compared in plain text at request time.
+
+Usernames are `firstname.lastname`, which is what a real deployment issues
+and what a client expects to be handed. The previous set - `admin`,
+`manager`, `analyst`, with `Admin@2026` and friends - announced both an
+account's privilege and its password from the username alone.
 """
 from __future__ import annotations
 
@@ -18,6 +23,7 @@ from app.core.security import hash_password, verify_password
 class AppUser:
     username: str
     full_name: str
+    job_title: str
     role: str
     password_hash: str
 
@@ -25,25 +31,25 @@ class AppUser:
 @lru_cache
 def _directory() -> dict[str, AppUser]:
     settings = get_settings()
+    # Five accounts covering the people who would actually open this: whoever
+    # sets it up, two who run sites day to day, the analyst who questions the
+    # numbers, and the director who reads the summary.
+    people = [
+        ("priya.raghavan", "Priya Raghavan", "IT Systems Administrator", "ADMIN", settings.auth_password_1),
+        ("daniel.okonkwo", "Daniel Okonkwo", "Regional Operations Manager", "OPERATIONS_MANAGER", settings.auth_password_2),
+        ("sofia.marchetti", "Sofia Marchetti", "Site Operations Manager", "OPERATIONS_MANAGER", settings.auth_password_3),
+        ("thomas.beaumont", "Thomas Beaumont", "Workforce Data Analyst", "DATA_ANALYST", settings.auth_password_4),
+        ("grace.lindqvist", "Grace Lindqvist", "Director of Operations", "EXECUTIVE", settings.auth_password_5),
+    ]
     users = [
         AppUser(
-            username="admin",
-            full_name="Alex Nguyen",
-            role="ADMIN",
-            password_hash=hash_password(settings.auth_admin_password),
-        ),
-        AppUser(
-            username="manager",
-            full_name="Omar Diaz",
-            role="OPERATIONS_MANAGER",
-            password_hash=hash_password(settings.auth_manager_password),
-        ),
-        AppUser(
-            username="analyst",
-            full_name="Dana Singh",
-            role="DATA_ANALYST",
-            password_hash=hash_password(settings.auth_analyst_password),
-        ),
+            username=username,
+            full_name=full_name,
+            job_title=job_title,
+            role=role,
+            password_hash=hash_password(password),
+        )
+        for username, full_name, job_title, role, password in people
     ]
     return {u.username: u for u in users}
 
@@ -63,3 +69,8 @@ def authenticate(username: str, password: str) -> AppUser | None:
 
 def get_user(username: str) -> AppUser | None:
     return _directory().get(username.strip().lower())
+
+
+def list_users() -> list[AppUser]:
+    """Every account, for a handover sheet. Never carries a password."""
+    return list(_directory().values())

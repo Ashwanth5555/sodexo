@@ -6,13 +6,18 @@ const NAV_ITEMS = [
   { to: '/data-quality', label: 'Data Quality', icon: Database },
 ]
 
+/** Where "Labor Forecasting" lands when it is opened rather than resumed.
+ *  Exported because the route redirect and the page's own default both need
+ *  it, and it used to be the literal 'model-training' written out in three
+ *  places - which is how they came to disagree with the sidebar's own order. */
+export const LABOR_FORECASTING_HOME = 'demand-drivers'
+
 const LABOR_FORECASTING_SECTIONS = [
   { slug: 'demand-drivers', label: 'Demand Drivers & Feature Mapping' },
   { slug: 'data-analysis', label: 'Data Analysis' },
   { slug: 'data-preprocessing', label: 'Data Pre-processing' },
   { slug: 'model-training', label: 'Model Training' },
   { slug: 'forecast-explorer', label: 'Forecast Explorer' },
-  { slug: 'drift-monitoring', label: 'Drift Monitoring' },
   { slug: 'staffing-impact', label: 'Staffing Impact' },
   { slug: 'model-performance', label: 'Model Performance' },
 ]
@@ -62,7 +67,7 @@ export function Sidebar() {
         ))}
 
         <button
-          onClick={() => navigate(isForecastingActive ? location.pathname : '/labor-forecasting/model-training')}
+          onClick={() => navigate(isForecastingActive ? location.pathname : `/labor-forecasting/${LABOR_FORECASTING_HOME}`)}
           className={`mb-1 flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left text-sm transition-colors ${
             isForecastingActive ? 'bg-[var(--color-primary)] text-white' : 'text-[var(--color-text-muted)] hover:bg-[var(--color-surface-2)] hover:text-[var(--color-text)]'
           }`}
@@ -93,7 +98,7 @@ export function Sidebar() {
           <NavItem key={item.to} to={item.to} label={item.label} Icon={item.icon} />
         ))}
       </nav>
-      <div className="px-4 py-4 text-[10px] text-[var(--color-text-muted)]">Enterprise data via UKG/Workday/POS/Payroll/ERP connectors.</div>
+      <div className="px-4 py-4 text-[10px] text-[var(--color-text-muted)]">Forecasts run on the data you upload. Nothing is retained after a restart.</div>
     </aside>
   )
 }

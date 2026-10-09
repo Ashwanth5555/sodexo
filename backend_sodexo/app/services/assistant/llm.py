@@ -26,19 +26,22 @@ LINE_BREAK = chr(10)
 MAX_HISTORY_TURNS = 6
 MAX_HISTORY_CHARS = 500
 
-_SYSTEM_PROMPT = """You are the workforce assistant for a Sodexo Healthcare labor-forecasting
-application (Food & Nutrition and Retail & Cafe Services, across 2 hospital locations -
-Community Hospital and Regional Medical Center). Each turn you are given structured facts
-already computed by the application's own services: forecast numbers and trend direction,
-labor cost and budget, punch anomalies, predictive risk scores, and recommendations.
+_SYSTEM_PROMPT = """You are the forecasting assistant for a labor-forecasting application. Every series
+comes from a data file the user uploaded themselves, so the sites, departments, products or
+regions you are asked about are whatever their file contains - never assume a fixed set.
+Each turn you are given structured facts already computed by the application's own services:
+forecast numbers and trend direction, model accuracy, drift status, data quality, and
+recommendations.
 
 GROUNDING
 1. Use ONLY the numbers in the provided facts. Never invent or estimate a figure, a staffing
    gap, a forecast, a name, or a saving.
 2. If the facts do not contain what was asked, say so in one line and name what is missing -
    never fill the hole with a plausible number.
-3. required_headcount and scheduled_headcount are PEOPLE ON SHIFT, not hours. Never call
-   them hours or staff-hours.
+3. Staffing figures are in the unit of the client's own target column, which each
+   staffing_outlook row states in its "measured_in" field - it may be people, hours, meals or
+   money. Use that name, or no unit at all. Never assume people, and never call a figure
+   headcount unless "measured_in" says so.
 4. Attribute every figure to the site or department it belongs to. When a "scope" field names
    specific sites or departments, answer for those only: lead with their own row from the
    facts, not with the company-wide total, and do not present a scoped figure as
@@ -54,15 +57,21 @@ GROUNDING
    rather than describing the shape vaguely.
 8. A short follow-up ("why?", "what about the cafe?") refers to the previous turn. Carry that
    subject forward instead of asking the user to repeat it.
-9. Always carry the unit: percentages as 4.2%, money as $12,400, hours as 544 hours,
-   headcount as 10 people, and an average demand figure as people per hour (58.4 people/hour).
-   Never state a bare decimal.
+9. Always carry the unit: percentages as 4.2%, money as $12,400, and everything else in the
+   unit the facts name for it. Never state a bare decimal, and never invent a unit the facts
+   do not give.
 10. A budget variance is signed: negative is UNDER budget, positive is OVER. Say which in
    words - "26% under budget", never "-26% vs budget" on its own.
 11. Do not recombine, re-derive or round figures together. Take each number with the label the
-   facts give it: required_headcount is the requirement, scheduled_headcount is what is
-   rostered, and the shortfall is the difference the facts already state. Restating one as
-   another is the single worst error you can make here.
+   facts give it: "required" is the requirement, "planned" is what is rostered, and the
+   shortfall is the difference the facts already state. Restating one as another is the
+   single worst error you can make here.
+11a. A staffing_outlook row describes a whole horizon. "periods_short_ahead" and
+   "cover_to_find" decide whether a series is short, and "worst_period" says when. Every
+   field ending in "_in_latest_period" describes one single period and can never answer a
+   question about the horizon. A series with periods_short_ahead above zero IS short, whatever
+   its latest period says - the recommendations page reads the same horizon and will
+   contradict you.
 12. Forecast facts carry a "forecast_at_requested_horizon" object per champion, with a "basis"
    field that is either "validated model forecast" (daily/weekly - the model's own real,
    trained-and-tested output) or "historical seasonal projection - NOT a validated forecast"
@@ -77,7 +86,7 @@ GROUNDING
 
 SCOPE
 Stay inside this application's domain: labor demand forecasting, staffing, cost and budget,
-punch and attendance issues, predictive risk, recommendations, data ingestion/quality, and
+recommendations, model accuracy, drift, data quality, and
 demand or model drift. For anything else, decline briefly and point back to those topics.
 
 TOOLS
@@ -189,9 +198,6 @@ def _cap(text: str) -> str:
 
 _TOPIC_LABELS = {
     "forecast": "Demand and staffing",
-    "labor_cost": "Cost and overtime",
-    "punch": "Punch and attendance",
-    "risk": "Employee risk",
     "recommendations": "Recommended action",
     "model_performance": "Model reliability",
     "data_quality": "Data quality",
@@ -205,9 +211,6 @@ def _template_answer(question: str, facts: dict) -> str:
     comes straight from the facts passed in; nothing here is invented."""
     formatters = {
         "forecast": _format_forecast,
-        "labor_cost": _format_labor_cost,
-        "punch": _format_punch,
-        "risk": _format_risk,
         "recommendations": _format_recommendations,
         "model_performance": _format_model_performance,
         "data_quality": _format_data_quality,
@@ -235,80 +238,35 @@ def _format_forecast(payload: dict) -> str:
     parts = []
     for c in payload.get("champions", [])[:4]:
         trend = c.get("trend")
+        unit = c.get("unit") or "required staff/hour"
         h = c.get("forecast_at_requested_horizon")
         if h and h.get("basis") == "historical seasonal projection - NOT a validated forecast":
             parts.append(
                 f"{c['series']}: no validated {horizon} forecast exists (the model is only validated 7 days ahead) - "
-                f"the {horizon} projection from recent history is {h.get('projected_avg')} avg required staff/hour."
+                f"the {horizon} projection from recent history is {h.get('projected_avg')} avg {unit}."
             )
         elif h and h.get("horizon") == "daily" and h.get("days"):
             days_str = ", ".join(f"{d['date']}: {d['forecast']}" for d in h["days"][:7])
-            parts.append(f"{c['series']}: daily forecast - {days_str} (staff/hour).")
+            parts.append(f"{c['series']}: daily forecast - {days_str} ({unit}).")
         elif trend:
             direction_phrase = trend["direction"] if trend["direction"] == "flat" else f"{trend['direction']} {abs(trend['pct_change'])}%"
             parts.append(
                 f"{c['series']}: {c['model']} ({c['accuracy']}% backtest accuracy) forecasts demand {direction_phrase} over the next 7 days "
-                f"({trend['avg_recent_actual']} -> {trend['avg_forecast_next_7d']} avg required staff/hour)."
+                f"({trend['avg_recent_actual']} -> {trend['avg_forecast_next_7d']} avg {unit})."
             )
         else:
             parts.append(f"{c['series']}: champion model is {c['model']} ({c['accuracy']}% backtest accuracy).")
-    for g in payload.get("latest_staffing_gap", [])[:4]:
-        if g.get("status") != "Balanced":
-            parts.append(f"{g['series']} is currently {g['status'].lower()} ({g['scheduled_headcount']} scheduled vs. {g['required_headcount']} required).")
-    return " ".join(parts)
-
-
-def _format_labor_cost(payload: dict) -> str:
-    if payload.get("status"):
-        return payload["status"]
-    k = payload.get("kpis", {})
-    parts = []
-    if k.get("total_labor_cost") is not None:
-        budget_note = f", {k['labor_cost_vs_budget_pct']:+.1f}% vs. budget" if k.get("labor_cost_vs_budget_pct") is not None else ""
-        parts.append(f"Total labor cost is ${k['total_labor_cost']:,.0f}{budget_note}.")
-    if k.get("overtime_hours") is not None:
-        parts.append(f"Overtime is {k['overtime_hours']:.0f} hours (${k.get('overtime_cost') or 0:,.0f}).")
-    over = payload.get("over_budget_departments") or []
-    if over:
-        names = ", ".join(f"{o.get('location')} / {o.get('department')}" for o in over[:3])
-        parts.append(f"Over budget by more than 10%: {names}.")
-    else:
-        parts.append("No department is currently over budget by more than 10%.")
-    return " ".join(parts)
-
-
-def _format_punch(payload: dict) -> str:
-    if payload.get("status"):
-        return payload["status"]
-    k = payload.get("kpis", {})
-    if not k:
-        return ""
-    parts = [f"{k.get('total_punches', 0)} punches reviewed, {k.get('exception_rate_pct', 0)}% flagged as exceptions."]
-    flagged = [
-        (label, k.get(key)) for key, label in [
-            ("missed_punches", "missed punches"), ("suspicious_punch_patterns", "suspicious buddy-punch patterns"),
-            ("payroll_exceptions", "potential payroll exceptions"),
-        ] if k.get(key)
-    ]
-    if flagged:
-        parts.append("Notable: " + ", ".join(f"{count} {label}" for label, count in flagged) + ".")
-    top = payload.get("most_flagged_employees") or []
-    if top:
-        parts.append(f"Most flagged: {top[0]['employee']} ({top[0]['exceptions']} exceptions).")
-    return " ".join(parts)
-
-
-def _format_risk(payload: dict) -> str:
-    parts = []
-    for m in payload.get("risk_models", [])[:4]:
-        if m.get("status") == "not_applicable":
-            continue
-        if m.get("high_risk_employee_count"):
-            highest = (m.get("highest_risk_employees") or [{}])[0]
-            named = f" Highest: {highest['employee']} ({highest['risk_pct']}%)." if highest.get("employee") else ""
-            parts.append(f"{m['model']}: {m['high_risk_employee_count']} employees currently flagged High risk (ROC-AUC {m.get('roc_auc')}).{named}")
-    if payload.get("turnover_risk"):
-        parts.append(f"Turnover risk: {payload['turnover_risk']}")
+    for g in payload.get("staffing_outlook", [])[:4]:
+        if g.get("periods_short_ahead"):
+            parts.append(
+                f"{g['series']} falls short in {g['periods_short_ahead']} of the next {g['periods_ahead']} periods "
+                f"- {g['cover_to_find']} of cover to find, worst on {str(g.get('worst_period'))[:10]}."
+            )
+        elif g.get("status_in_latest_period") and g.get("status_in_latest_period") != "Balanced":
+            parts.append(
+                f"{g['series']} is {g['status_in_latest_period'].lower()} in the last period on record "
+                f"({g['planned_in_latest_period']} planned vs. {g['required_in_latest_period']} required)."
+            )
     return " ".join(parts)
 
 

@@ -12,8 +12,7 @@ import pandas as pd
 from sqlalchemy.orm import Session
 
 from app.models import ModelPrediction, ModelRun
-from app.services.forecasting import data as series_data
-from app.services.forecasting.contract import FAST_HOLDOUT_MODEL_IDS, FORECAST_HORIZON_SLOTS, MODEL_SPECS, SeriesConfig
+from app.services.forecasting.contract import FAST_HOLDOUT_MODEL_IDS, FORECAST_HORIZON_SLOTS, MODEL_SPECS, SLOW_MODEL_SKIP_REASON, SeriesConfig
 from app.services.forecasting.eligibility import check_eligibility
 from app.services.forecasting.metrics import average_metrics, calculate_metrics, is_valid_metric
 from app.services.forecasting.models import FITTERS, ModelContext
@@ -80,19 +79,6 @@ def _empirical_interval_offsets(backtest_records: list[dict]) -> tuple[float, fl
     return float(np.percentile(residuals, 10)), float(np.percentile(residuals, 90))
 
 
-def train_series(db: Session, series: SeriesConfig, job_id: str, on_step=None, max_training_slots: int | None = None) -> list[ModelRun]:
-    """Train the full portfolio for one built-in (canonical-schema) series."""
-    history = series_data.load_series_forecast_frame(db, series)
-    train_df_full = series_data.windowed_training_frame(history, max_slots=max_training_slots)
-    seasonal_period = resolve_seasonal_period(train_df_full["target"])
-    exog_columns = series_data.enabled_exog_columns_for(db, series)
-    ctx = ModelContext(seasonal_period, exog_columns)
-    last_timestamp = train_df_full["date"].iloc[-1]
-    future_df = series_data.future_calendar_frame(db, series, last_timestamp, FORECAST_HORIZON_SLOTS)
-    future_df = series_data.attach_future_lags(future_df, history, series)
-    return run_portfolio(db, series.key, train_df_full, future_df, ctx, job_id, on_step=on_step)
-
-
 def run_portfolio(
     db: Session,
     series_key: str,
@@ -101,18 +87,40 @@ def run_portfolio(
     ctx: ModelContext,
     job_id: str,
     on_step=None,
+    on_start=None,
+    skip_models: frozenset[str] | None = None,
 ) -> list[ModelRun]:
     """Run every model in the portfolio over one prepared series.
 
     Split out of train_series so an uploaded dataset - whose frames come from a
     CSV rather than the canonical tables - is evaluated, scored, persisted and
     ranked by exactly the same code path.
+
+    skip_models names models this run should not fit (the fast training
+    profile). They are still recorded as not_applicable with a reason, so the
+    leaderboard accounts for all 13 and nobody has to guess why a model they
+    remember is absent.
     """
     seasonal_period = ctx.seasonal_period
+    skip_models = skip_models or frozenset()
 
     runs: list[ModelRun] = []
     for model_id, label, dependency_module in MODEL_SPECS:
         started = time.perf_counter()
+        if on_start:
+            on_start(label)
+        if model_id in skip_models:
+            run = ModelRun(
+                job_id=job_id, series_key=series_key, model_id=model_id, model_label=label,
+                status="not_applicable", failure_reason=SLOW_MODEL_SKIP_REASON,
+            )
+            db.add(run)
+            db.commit()
+            runs.append(run)
+            if on_step:
+                on_step(label)
+            continue
+
         eligible, reason = check_eligibility(
             model_id, dependency_module, train_df_full, seasonal_period,
             ctx.exog_columns, cycle=ctx.periods_per_week, var_pair_reason=ctx.var_pair_reason,

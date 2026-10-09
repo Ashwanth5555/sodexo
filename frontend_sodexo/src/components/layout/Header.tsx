@@ -26,7 +26,7 @@ export function Header({ title, subtitle }: { title: string; subtitle?: string }
           </div>
           <div className="text-right leading-tight">
             <div className="text-xs font-medium text-[var(--color-text)]">{user.full_name}</div>
-            <div className="text-[10px] text-[var(--color-text-muted)]">{ROLE_LABELS[user.role] ?? user.role}</div>
+            <div className="text-[10px] text-[var(--color-text-muted)]">{user.job_title || ROLE_LABELS[user.role] || user.role}</div>
           </div>
           <button
             onClick={logout}
